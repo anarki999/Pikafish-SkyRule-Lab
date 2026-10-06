@@ -19,7 +19,9 @@
 #ifndef POSITION_H_INCLUDED
 #define POSITION_H_INCLUDED
 
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
@@ -71,7 +73,6 @@ inline bool chinese_like() {
 }
 
 }  // namespace RuleConfig
-
 
 
 struct SkyChaseMap {
@@ -134,9 +135,6 @@ struct StateInfo {
     Piece      capturedPiece;
 
     // SkyRule historical move state reconstructed from the supplied custom binary.
-    // The three u16 masks occupy the padding that precedes Move in the stock layout:
-    // victims attacked by the move, identities of checking pieces, and identities of
-    // chasing pieces. They are filled lazily while rolling a repetition cycle back.
     u16        skyVictims;
     u16        skyCheckers;
     u16        skyChasers;
@@ -148,21 +146,15 @@ struct StateInfo {
 
 
 // A list to keep track of the position states along the setup moves (from the
-// start position to the position just before the search starts). Needed by
-// 'draw by repetition' detection. Use a std::deque because pointers to
-// elements are not invalidated upon list resizing.
+// start position to the position just before the search starts).
 using StateListPtr = std::unique_ptr<std::deque<StateInfo>>;
 
 // This error should be used whenever a position is suspected to be unsupported
-// by the engine. In particular positions that may cause hard errors like segmentation fault.
+// by the engine.
 struct PositionSetError: std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
-// Position class stores information regarding the board representation as
-// pieces, side to move, hash keys, etc. Important methods are
-// do_move() and undo_move(), used by the search to update node info when
-// traversing the search tree.
 class Position {
    public:
     static void init();
@@ -177,7 +169,7 @@ class Position {
     std::string                     fen() const;
 
     // Position representation
-    Bitboard pieces() const;  // All pieces
+    Bitboard pieces() const;
     template<typename... PieceTypes>
     Bitboard pieces(PieceTypes... pts) const;
     Bitboard pieces(Color c) const;
@@ -218,7 +210,7 @@ class Position {
     Piece captured_piece() const;
 
     // Doing and undoing moves
-    void do_move(Move m, StateInfo& newSt, const TranspositionTable* tt);
+    void do_move(Move m, StateInfo& newSt, const TranspositionTable* tt = nullptr);
     void do_move(Move                      m,
                  StateInfo&                newSt,
                  bool                      givesCheck,
@@ -245,10 +237,6 @@ class Position {
     int   game_ply() const;
     bool  rule_judge(Value& result, int ply = 0);
     int   rule60_count() const;
-    // chased() returns a ChaseMap (victim, attacker) pair set so that the
-    // perpetual-chase accumulation can correctly verify the SAME attacker keeps
-    // chasing the SAME victim across the repetition cycle. This is the core of
-    // the "常捉无根子" detector shared by AsianRule, SkyRule and YitianRule.
     ChaseMap chased(Color c);
     bool  has_mate_threat(Depth d = -1);
     Value major_material(Color c) const;
@@ -265,24 +253,26 @@ class Position {
     void swap_piece(Square s, Piece pc, DirtyThreats* const dts = nullptr);
 
    private:
-    // Initialization helpers (used while setting up a position)
-    void set_state() const;
-    void set_check_info() const;
-
-    // Other helpers
-    template<bool ComputeRay = true>
-    void update_piece_threats(Piece pc, bool putPiece, Square s, DirtyThreats* const dts);
-    void move_piece(Square from, Square to, DirtyThreats* const dts = nullptr);
-    std::pair<Piece, int> do_move(Move m);
-    void                  undo_move(Move m, Piece captured, int id = 0);
-    Value                 detect_chases(int d, int ply = 0);
+    // 天規與循環檢測輔助函數
+    void                  init_sky_ids();
+    int                   step_sky_info(int count);
     void                  set_sky_info(int d);
     Value                 detect_sky_cycle(int d, int ply = 0);
-    // The extra bitboard b masks out checkers that should be ignored (e.g. the
-    // pre-existing checkers on our own king), so that we only flag moves that
-    // create NEW attacks on the king. Shared by all chasing detectors.
+    Value                 detect_chases(int d, int ply = 0);
+
+    // 初始化與狀態設置
+    void                  set_state() const;
+    void                  set_check_info() const;
+
+    // 棋盤推演與攻擊判斷輔助
+    template<bool ComputeRay = true>
+    void                  update_piece_threats(Piece pc, bool putPiece, Square s, DirtyThreats* const dts);
+    void                  move_piece(Square from, Square to, DirtyThreats* const dts = nullptr);
+    std::pair<Piece, int> do_move(Move m);
+    void                  undo_move(Move m, Piece captured, int id = 0);
     bool                  chase_legal(Move m, Bitboard b = 0) const;
     SkyChaseMap           sky_chased(Color c);
+	
     template<bool AfterMove = false>
     Key adjust_key60(Key k) const;
 
@@ -472,7 +462,7 @@ inline void Position::swap_piece(Square s, Piece pc, DirtyThreats* const dts) {
         update_piece_threats<false>(pc, true, s, dts);
 }
 
-inline void Position::do_move(Move m, StateInfo& newSt, const TranspositionTable* tt = nullptr) {
+inline void Position::do_move(Move m, StateInfo& newSt, const TranspositionTable* tt) {
     new (&scratchDirties.dirtyThreats) DirtyThreats;
     do_move(m, newSt, gives_check(m), scratchDirties, tt, nullptr);
 }
