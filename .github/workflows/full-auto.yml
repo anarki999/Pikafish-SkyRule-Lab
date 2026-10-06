@@ -21,17 +21,19 @@ jobs:
           git fetch upstream --prune --tags
           git fetch upstream master
           git checkout master
-          cp -r patches /tmp/patches
-          cp -r.github /tmp/.github
+          cp -r patches /tmp/patches || true
+          cp -r.github /tmp/.github || true
           git reset --hard upstream/master
-          cp -r /tmp/patches patches
-          cp -r /tmp/.github.github
+          cp -r /tmp/patches patches || true
+          cp -r /tmp/.github.github || true
           rm -rf /tmp/patches /tmp/.github
           git config user.name "bot"
           git config user.email "bot@bot.com"
+          ls -l patches/
+          ls -l.github/workflows/
           for p in patches/*.patch; do echo "Applying $p"; git am -3 "$p" || (git am --abort; patch -p1 --merge < "$p" && git add -A && git commit -m "apply $p [skip full-auto]"); done
           cd src && make -j2 profile-build ARCH=x86-64-avx2
       - run: |
-          git add.github/workflows/full-auto.yml patches/
+          git add.github/workflows/full-auto.yml patches/ || true
           git diff --staged --quiet || git commit -m "restore workflows [skip full-auto]"
           git push origin master --force
