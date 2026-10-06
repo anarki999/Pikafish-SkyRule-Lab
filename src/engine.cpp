@@ -106,7 +106,83 @@ Engine::Engine(std::optional<std::filesystem::path> path) :
 
     options.add("nodestime", Option(0, 0, 10000));
 
-    options.add("UCI_ShowWDL", Option(false));
+    options.add("UCI_ShowWDL", Option(true));
+	
+	options.add(  //
+      "Mate Threat Depth", Option(10, 0, 10, [](const Option& o) {
+          RuleConfig::mateThreatDepth = int(o);
+          return std::nullopt;
+      }));
+
+options.add( //
+      "Repetition Rule",
+      Option("SkyRule var SkyRule var AsianRule var ChineseRule var ComputerRule var YitianRule var AllowChase var NoJudgement",
+             "SkyRule", [this](const Option& o) {
+                 using RR = RuleConfig::RepetitionRule;
+
+                 RuleConfig::repetitionRule =
+                   o == "ChineseRule"    ? RR::CHINESE
+                   : o == "SkyRule"      ? RR::SKY
+                   : o == "ComputerRule" ? RR::COMPUTER
+                   : o == "YitianRule"   ? RR::YITIAN
+                   : o == "AllowChase"   ? RR::ALLOW_CHASE
+                   : o == "NoJudgement"  ? RR::NO_JUDGEMENT
+                                         : RR::ASIAN;
+
+                 // 同步更新 Rule60MaxPly 變數與 Option 顯示值
+                 if (RuleConfig::repetitionRule == RR::ASIAN
+                     || RuleConfig::repetitionRule == RR::SKY)
+                 {
+                     RuleConfig::rule60MaxPly = 120;
+                     options["Rule60MaxPly"]  = std::string("120");
+                 }
+                 else if (RuleConfig::repetitionRule == RR::YITIAN)
+                 {
+                     RuleConfig::rule60MaxPly = 140;
+                     options["Rule60MaxPly"]  = std::string("140");
+                 }
+
+                 // 倚天規則預設關閉六十步自然限著
+                 if (RuleConfig::repetitionRule == RR::YITIAN)
+                 {
+                     RuleConfig::sixtyMoveRule = false;
+                     options["Sixty Move Rule"] = std::string("false");
+                 }
+
+                 return std::nullopt;
+             }));
+
+options.add( //
+      "Draw Rule",
+      Option("None var None var DrawAsBlackWin var DrawAsRedWin var DrawRepAsBlackWin var DrawRepAsRedWin",
+             "None", [](const Option& o) {
+                 using DR = RuleConfig::DrawRule;
+                 RuleConfig::drawRule =
+                   o == "DrawAsBlackWin"      ? DR::BLACK_WIN
+                   : o == "DrawAsRedWin"      ? DR::RED_WIN
+                   : o == "DrawRepAsBlackWin" ? DR::REP_BLACK_WIN
+                   : o == "DrawRepAsRedWin"   ? DR::REP_RED_WIN
+                                              : DR::NONE;
+                 return std::nullopt;
+             }));
+
+    options.add(  //
+      "Sixty Move Rule", Option(true, [](const Option& o) {
+          RuleConfig::sixtyMoveRule =
+            bool(o) && RuleConfig::repetitionRule != RuleConfig::RepetitionRule::YITIAN;
+          return std::nullopt;
+      }));
+
+    options.add(  //
+      "Rule60MaxPly", Option(120, 1, 150, [](const Option& o) {
+          using RR = RuleConfig::RepetitionRule;
+          // 亞洲規則與天規鎖定為 120 回合（60 步）
+          RuleConfig::rule60MaxPly =
+            (RuleConfig::repetitionRule == RR::ASIAN || RuleConfig::repetitionRule == RR::SKY)
+              ? 120
+              : int(o);
+          return std::nullopt;
+      }));
 
     options.add(  //
       "EvalFile", Option(EvalFileDefaultName, [this](const Option& o) {

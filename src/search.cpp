@@ -875,7 +875,7 @@ Value Search::Worker::search(
 
             // Partial workaround for the graph history interaction problem.
             // For high rule60 counts don't produce transposition table cutoffs.
-            if (pos.rule60_count() < 116)
+            if (pos.rule60_count() < RuleConfig::rule60MaxPly - 4)
             {
                 if (depth >= 7 && ttData.move && pos.pseudo_legal(ttData.move)
                     && pos.legal(ttData.move) && !is_decisive(ttData.value))
@@ -1864,12 +1864,12 @@ Value value_from_tt(Value v, int ply, int r60c) {
     // Handle win
     if (is_win(v))
         // Downgrade a potentially false mate score
-        return VALUE_MATE - v > 120 - r60c ? VALUE_MATE_IN_MAX_PLY - 1 : v - ply;
+        return VALUE_MATE - v > RuleConfig::rule60MaxPly - r60c ? VALUE_MATE_IN_MAX_PLY - 1 : v - ply;
 
     // Handle loss
     if (is_loss(v))
         // Downgrade a potentially false mate score
-        return VALUE_MATE + v > 120 - r60c ? VALUE_MATED_IN_MAX_PLY + 1 : v + ply;
+        return VALUE_MATE + v > RuleConfig::rule60MaxPly - r60c ? VALUE_MATED_IN_MAX_PLY + 1 : v + ply;
 
     return v;
 }

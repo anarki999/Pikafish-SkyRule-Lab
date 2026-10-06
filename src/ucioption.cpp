@@ -65,6 +65,12 @@ const Option& OptionsMap::operator[](const std::string& name) const {
     return it->second;
 }
 
+Option& OptionsMap::operator[](const std::string& name) {
+    auto it = options_map.find(name);
+    assert(it != options_map.end());
+    return it->second;
+}
+
 // Inits options and assigns idx in the correct printing order
 void OptionsMap::add(const std::string& name, const Option& option) {
     if (!options_map.count(name))
@@ -159,11 +165,12 @@ Option& Option::operator=(const std::string& v) {
 
     if (type == "combo")
     {
-        OptionsMap         comboMap;  // To have case insensitive compare
-        std::string        token;
+        OptionsMap comboMap; // To have case insensitive compare
+        std::string token;
         std::istringstream ss(defaultValue);
         while (ss >> token)
-            comboMap.add(token, Option());
+            if (!comboMap.count(token))
+                comboMap.add(token, Option());
         if (!comboMap.count(v) || v == "var")
             return *this;
     }
