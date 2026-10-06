@@ -1212,86 +1212,69 @@ void Position::init_sky_ids() {
 }
 
 
-int Position::step_sky_info(int count) {
-    int processed = 0;
-    for (int i = 0; i < count && st && st->previous; ++i)
-    {
-        StateInfo* cur = st;
-        if (!cur->move.is_ok() || cur->capturedPiece != NO_PIECE)
-            break;
-
-        cur->skyVictims  = 0;
-        cur->skyCheckers = 0;
-        cur->skyChasers  = 0;
-
-        const Color mover = ~sideToMove;
-
-        if (cur->checkersBB)
-        {
-            cur->skyVictims = 0xFFFF;
-            Bitboard checks = cur->checkersBB;
-            while (checks)
-            {
-                Square sq = pop_lsb(checks);
-                int id = idBoard[sq];
-                if (id >= 0 && id < 16)
-                    cur->skyCheckers |= u16(1u << id);
-            }
-
-            undo_move(cur->move, cur->capturedPiece, 0);
-            st = cur->previous;
-            ++processed;
-            continue;
-        }
-
-        SkyChaseMap after = sky_chased(mover);
-        undo_move(cur->move, cur->capturedPiece, 0);
-        st = cur->previous;
-        SkyChaseMap before = sky_chased(mover);
-        SkyChaseMap exact  = after.exact_diff(before);
-        cur->skyVictims = exact.victims();
-        cur->skyChasers = exact.chasers();
-        ++processed;
-    }
-    return processed;
-}
-
-void Position::set_sky_info(int d) {
-    init_sky_ids();
-    step_sky_info(d);
-}
-
-
 Value Position::detect_sky_cycle(int d, int ply) {
 
     if (d < 4 || !st)
         return VALUE_DRAW;
 
-    d = std::min(d, 128);
-
     const Color currentSide = sideToMove;
     StateInfo* const start = st;
 
-    // 1. 收集前 d 步 StateInfo 指針
-    std::array<StateInfo*, 128> q{};
-    int qSize = 0;
-    for (StateInfo* p = start; p && p->previous && qSize < d; p = p->previous) {
+    // 1. Determine safe history depth (no captures)
+    int historyDepth = std::min(start->pliesFromNull, 128);
+    std::array<StateInfo*, 128> hist{};
+    int hSize = 0;
+    for (StateInfo* p = start; p && p->previous && hSize < historyDepth; p = p->previous) {
         if (p->capturedPiece != NO_PIECE) break;
-        q[qSize++] = p;
+        hist[hSize++] = p;
     }
-    if (qSize < d)
+    if (hSize < d)
         return VALUE_DRAW;
+    historyDepth = hSize;
 
-    // 直接精確獲取 s0_type 與 s1_type（無須操作棋盤退步/進步）
-    PieceType s0_type = (q[0] && q[0]->move.is_ok()) ? type_of(piece_on(q[0]->move.to_sq())) : NO_PIECE_TYPE;
-    PieceType s1_type = (q[1] && q[1]->move.is_ok()) ? type_of(piece_on(q[1]->move.to_sq())) : NO_PIECE_TYPE;
+    PieceType s0_type = (hist[0] && hist[0]->move.is_ok()) ? type_of(piece_on(hist[0]->move.to_sq())) : NO_PIECE_TYPE;
+    PieceType s1_type = (hist[1] && hist[1]->move.is_ok()) ? type_of(piece_on(hist[1]->move.to_sq())) : NO_PIECE_TYPE;
+
+    // Local arrays for evaluating without mutating shared StateInfo
+    std::array<u16, 128> v_skyVictims{};
+    std::array<u16, 128> v_skyCheckers{};
+    std::array<u16, 128> v_skyChasers{};
+    std::array<bool, 128> v_checked{};
 
     init_sky_ids();
 
-    // 2. 推演前 d 步天規信息
-    int processedPlies = step_sky_info(d);
+    int processedPlies = 0;
+    auto evaluate_plies = [&](int targetDepth) {
+        while (processedPlies < targetDepth) {
+            StateInfo* cur = hist[processedPlies];
+            const Color mover = ~sideToMove;
+            v_checked[processedPlies] = bool(cur->checkersBB);
 
-    auto checked = [](const StateInfo* s) { return bool(s->checkersBB); };
+            if (cur->checkersBB) {
+                v_skyVictims[processedPlies] = 0xFFFF;
+                Bitboard checks = cur->checkersBB;
+                while (checks) {
+                    Square sq = pop_lsb(checks);
+                    int id = idBoard[sq];
+                    if (id >= 0 && id < 16)
+                        v_skyCheckers[processedPlies] |= u16(1u << id);
+                }
+                undo_move(cur->move, cur->capturedPiece, 0);
+            } else {
+                SkyChaseMap after = sky_chased(mover);
+                undo_move(cur->move, cur->capturedPiece, 0);
+                SkyChaseMap before = sky_chased(mover);
+                SkyChaseMap exact = after.exact_diff(before);
+                v_skyVictims[processedPlies] = exact.victims();
+                v_skyChasers[processedPlies] = exact.chasers();
+            }
+            processedPlies++;
+        }
+    };
+
+    // Evaluate the immediate cycle
+    evaluate_plies(d);
+
     auto loss_for = [&](Color offender) {
         return offender == currentSide ? mated_in(ply) : mate_in(ply);
     };
@@ -1299,106 +1282,73 @@ Value Position::detect_sky_cycle(int d, int ply) {
     const Color AColor = ~currentSide;
     const Color BColor = currentSide;
 
-    const StateInfo* s0 = q[0];
-    const StateInfo* s1 = q[1];
-    const StateInfo* s2 = q[2];
-    const StateInfo* s3 = q[3];
+    u16 A = v_skyVictims[0] & v_skyVictims[2];
+    u16 B = v_skyVictims[1] & v_skyVictims[3];
 
-    u16 A = s0->skyVictims & s2->skyVictims;
-    u16 B = s1->skyVictims & s3->skyVictims;
+    const bool splitA = v_skyVictims[0] && v_skyVictims[2] && A == 0;
+    const bool splitB = v_skyVictims[1] && v_skyVictims[3] && B == 0;
+    const bool checkIdleA = (v_checked[0] && v_skyVictims[2] == 0) || (v_checked[2] && v_skyVictims[0] == 0);
+    const bool checkIdleB = (v_checked[1] && v_skyVictims[3] == 0) || (v_checked[3] && v_skyVictims[1] == 0);
 
-    const bool splitA = s0->skyVictims && s2->skyVictims && A == 0;
-    const bool splitB = s1->skyVictims && s3->skyVictims && B == 0;
-    const bool checkIdleA = (checked(s0) && s2->skyVictims == 0)
-                         || (checked(s2) && s0->skyVictims == 0);
-    const bool checkIdleB = (checked(s1) && s3->skyVictims == 0)
-                         || (checked(s3) && s1->skyVictims == 0);
+    const bool mixedA = A && (v_checked[0] != v_checked[2]);
+    const bool mixedB = B && (v_checked[1] != v_checked[3]);
+    const bool differentA = mixedA && ((v_skyChasers[2] & u16(~v_skyCheckers[0])) || (v_skyChasers[0] & u16(~v_skyCheckers[2])));
+    const bool differentB = mixedB && ((v_skyChasers[3] & u16(~v_skyCheckers[1])) || (v_skyChasers[1] & u16(~v_skyCheckers[3])));
 
-    const bool mixedA = A && (checked(s0) != checked(s2));
-    const bool mixedB = B && (checked(s1) != checked(s3));
-    const bool differentA = mixedA
-      && ((s2->skyChasers & u16(~s0->skyCheckers))
-          || (s0->skyChasers & u16(~s2->skyCheckers)));
-    const bool differentB = mixedB
-      && ((s3->skyChasers & u16(~s1->skyCheckers))
-          || (s1->skyChasers & u16(~s3->skyCheckers)));
-
-    for (int i = 4; i < d; i += 2)
-    {
-        A &= q[i]->skyVictims;
+    for (int i = 4; i < d; i += 2) {
+        A &= v_skyVictims[i];
         if (i + 1 < d)
-            B &= q[i + 1]->skyVictims;
+            B &= v_skyVictims[i + 1];
     }
 
     // Fast Path 1: 無公共受害者
-    if (!A && !B)
-    {
-        if (splitA && checkIdleB && s0_type != KING)
-            return loss_for(AColor);
-        if (splitB && checkIdleA && s1_type != KING)
-            return loss_for(BColor);
+    if (!A && !B) {
+        if (splitA && checkIdleB && s0_type != KING) return loss_for(AColor);
+        if (splitB && checkIdleA && s1_type != KING) return loss_for(BColor);
         return VALUE_DRAW;
     }
 
     // Fast Path 2: 單方純長捉
-    if (A && !B)
-        return loss_for(AColor);
-    if (!A && B)
-        return loss_for(BColor);
+    if (A && !B) return loss_for(AColor);
+    if (!A && B) return loss_for(BColor);
 
     // Fast Path 3: 異身混合將捉
-    if (mixedA && !mixedB && differentA)
-        return loss_for(AColor);
-    if (!mixedA && mixedB && differentB)
-        return loss_for(BColor);
+    if (mixedA && !mixedB && differentA) return loss_for(AColor);
+    if (!mixedA && mixedB && differentB) return loss_for(BColor);
 
     // Slow Path 1: 一將一捉對純長捉
-    if (mixedA != mixedB)
-    {
-        const Color mixedColor = mixedA ? AColor : BColor;
-        return loss_for(mixedColor);
-    }
+    if (mixedA != mixedB) return loss_for(mixedA ? AColor : BColor);
 
     // Fast Path 4: 雙方皆混合將捉
-    if (mixedA && mixedB)
-    {
-        const bool phaseB = (checked(s1) && s0->skyChasers)
-                         || (checked(s3) && s2->skyChasers);
+    if (mixedA && mixedB) {
+        const bool phaseB = (v_checked[1] && v_skyChasers[0]) || (v_checked[3] && v_skyChasers[2]);
         return phaseB ? loss_for(BColor) : loss_for(AColor);
     }
 
-    // Slow Path 2: 延伸歷史檢查（直接利用已推演的 q 數組）
+    // Slow Path 2: 延伸歷史檢查
     auto extended_multi = [&](Color side, u16 commonVictims) {
+        evaluate_plies(historyDepth);
+
         int count = 0;
         u16 identities = 0;
-        
-        // 根據走子方選擇起始索引（AColor 為 start (i=0), BColor 為 start->previous (i=1)）
         int startIdx = (side == AColor) ? 0 : 1;
         
-        for (int i = startIdx; i < d; i += 2)
-        {
-            const StateInfo* p = q[i];
-            if (!p) break;
-
-            if (checked(p))
-                identities |= p->skyCheckers;
-            else
-            {
-                if (!(p->skyVictims & commonVictims))
-                    break;
-                identities |= p->skyChasers;
+        for (int i = startIdx; i < historyDepth; i += 2) {
+            if (v_checked[i]) {
+                identities |= v_skyCheckers[i];
+            } else {
+                if (!(v_skyVictims[i] & commonVictims)) break;
+                identities |= v_skyChasers[i];
             }
             ++count;
-            if (count >= 6 && (identities & u16(identities - 1)))
-                return true;
+            if (count >= 6 && (identities & u16(identities - 1))) return true;
         }
         return false;
     };
 
     const bool multiA = extended_multi(AColor, A);
     const bool multiB = extended_multi(BColor, B);
-    if (multiA != multiB)
-        return loss_for(multiA ? BColor : AColor);
+    if (multiA != multiB) return loss_for(multiA ? BColor : AColor);
 
     return VALUE_DRAW;
 }

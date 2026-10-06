@@ -255,8 +255,6 @@ class Position {
    private:
     // 天規與循環檢測輔助函數
     void                  init_sky_ids();
-    int                   step_sky_info(int count);
-    void                  set_sky_info(int d);
     Value                 detect_sky_cycle(int d, int ply = 0);
     Value                 detect_chases(int d, int ply = 0);
 
