@@ -1,0 +1,37 @@
+name: Full Auto Update Rule Sets
+on:
+  push:
+    branches: [master]
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  build:
+    if: "!contains(github.event.head_commit.message, '[skip full-auto]')"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: |
+          git remote add upstream https://github.com/official-pikafish/Pikafish.git || true
+          git fetch upstream --prune --tags
+          git fetch upstream master
+          git checkout master
+          cp -r patches /tmp/patches
+          cp -r.github /tmp/.github
+          git reset --hard upstream/master
+          cp -r /tmp/patches patches
+          cp -r /tmp/.github.github
+          rm -rf /tmp/patches /tmp/.github
+          git config user.name "bot"
+          git config user.email "bot@bot.com"
+          for p in patches/*.patch; do echo "Applying $p"; git am -3 "$p" || (git am --abort; patch -p1 --merge < "$p" && git add -A && git commit -m "apply $p [skip full-auto]"); done
+          cd src && make -j2 profile-build ARCH=x86-64-avx2
+      - run: |
+          git add.github/workflows/full-auto.yml patches/
+          git diff --staged --quiet || git commit -m "restore workflows [skip full-auto]"
+          git push origin master --force
