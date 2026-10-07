@@ -17,13 +17,14 @@
 */
 
 #include "position.h"
+
 #include <algorithm>
 #include <array>
 #include <cassert>
 #include <cctype>
 #include <cstddef>
-#include <cstring>
 #include <initializer_list>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -35,8 +36,8 @@
 #include "history.h"
 #include "misc.h"
 #include "movegen.h"
-#include "nnue/nnue_architecture.h"
 #include "nnue/nnue_common.h"
+#include "nnue/nnue_architecture.h"
 #include "tt.h"
 #include "uci.h"
 
@@ -48,11 +49,12 @@ using namespace Attacks;
 
 namespace RuleConfig {
 // Defaults: SkyRule with rule120, Sixty Move Rule off.
-RepetitionRule repetitionRule  = RepetitionRule::SKY;
-DrawRule       drawRule        = DrawRule::NONE;
-int            mateThreatDepth = 10;
-bool           sixtyMoveRule   = false;
-int            rule60MaxPly    = 120;
+// AsianRule and SkyRule default to rule120 (enforced in engine.cpp couplings).
+RepetitionRule		repetitionRule  = RepetitionRule::SKY;
+DrawRule				drawRule        = DrawRule::NONE;
+int							mateThreatDepth = 10;
+bool						sixtyMoveRule   = false;
+int							rule60MaxPly    = 120;
 }  // namespace RuleConfig
 
 namespace Zobrist {
@@ -72,14 +74,14 @@ static constexpr Piece Pieces[] = {W_ROOK, W_ADVISOR, W_CANNON, W_PAWN, W_KNIGHT
 // Returns an ASCII representation of the position
 std::ostream& operator<<(std::ostream& os, const Position& pos) {
 
-    os << "\n +---+---+---+---+---+---+---+---++\n";
+    os << "\n +---+---+---+---+---+---+---+---+---+\n";
 
     for (Rank r = RANK_9;; --r)
     {
         for (File f = FILE_A; f <= FILE_I; ++f)
             os << " | " << PieceToChar[pos.piece_on(make_square(f, r))];
 
-        os << " | " << int(r) << "\n +---+---+---+---+---+---+---+---++\n";
+        os << " | " << int(r) << "\n +---+---+---+---+---+---+---+---+---+\n";
 
         if (r == RANK_0)
             break;
@@ -111,7 +113,32 @@ void Position::init() {
 
 
 // Initializes the position object with the given FEN string.
+// The FEN string is strictly validated; if it is invalid or inconsistent,
+// a PositionSetError describing the problem is returned, otherwise std::nullopt.
 std::optional<PositionSetError> Position::set(const string& fenStr, StateInfo* si) {
+    /*
+   A FEN string defines a particular position using only the ASCII character set.
+
+   A FEN string contains six fields separated by a space. The fields are:
+
+   1) Piece placement (from white's perspective). Each rank is described, starting
+      with rank 9 and ending with rank 0. Within each rank, the contents of each
+      square are described from file A through file I. Following the Standard
+      Algebraic Notation (SAN), each piece is identified by a single letter taken
+      from the standard English names. White pieces are designated using upper-case
+      letters ("RACPNBK") whilst Black uses lowercase ("racpnbk"). Blank squares are
+      noted using digits 1 through 9 (the number of blank squares), and "/"
+      separates ranks.
+
+   2) Active color. "w" means white moves next, "b" means black.
+
+   3) Halfmove clock. This is the number of halfmoves since the last pawn advance
+      or capture. This is used to determine if a draw can be claimed under the
+      fifty-move rule.
+
+   4) Fullmove number. The number of the full move. It starts at 1, and is
+      incremented after Black's move.
+*/
 
     unsigned char     token;
     std::istringstream ss(fenStr);
@@ -128,7 +155,7 @@ std::optional<PositionSetError> Position::set(const string& fenStr, StateInfo* s
     // 3. 基礎狀態變數與 BloomFilter 清空
     gamePly = 0;
     sideToMove = WHITE;
-    filter = {};
+    filter = {}; // 若 BloomFilter 有 reset()，也可寫成 filter.reset();
 
     // 4. 初始化傳入的 StateInfo 結點
     std::memset(si, 0, sizeof(StateInfo));
@@ -213,6 +240,7 @@ std::optional<PositionSetError> Position::set(const string& fenStr, StateInfo* s
         for (PieceType pt : {ADVISOR, PAWN, BISHOP, KING})
         {
             Bitboard valid = Eval::NNUE::Features::HalfKAv2_hm::ValidBB[make_piece(c, pt)];
+            // NNUE mirroring feature does not allow white king on the right flank, we allow here.
             if (c == WHITE && pt == KING)
                 valid = HalfBB[WHITE] & Palace;
             if (pieces(c, pt) & ~valid)
@@ -247,6 +275,8 @@ std::optional<PositionSetError> Position::set(const string& fenStr, StateInfo* s
     if (gamePly < 0 || gamePly > 100000)
         return PositionSetError("Unsupported position. Game ply out of range.");
 
+    // Convert from fullmove starting from 1 to gamePly starting from 0,
+    // handle also common incorrect FEN with fullmove = 0.
     gamePly = std::max(2 * (gamePly - 1), 0) + (sideToMove == BLACK);
 
     set_state();
@@ -268,6 +298,7 @@ void Position::set_check_info() const {
 
     Square ksq = king_square(~sideToMove);
 
+    // We have to take special cares about the hollow cannons and checks
     st->needFullCheck =
       checkers() || (attacks_bb(ROOK, king_square(sideToMove)) & pieces(~sideToMove, CANNON));
 
@@ -289,7 +320,9 @@ void Position::set_check_info() const {
 }
 
 
-// Computes the hash keys of the position
+// Computes the hash keys of the position, and other
+// data that once computed is updated incrementally as moves are made.
+// The function is only used when a new position is set up
 void Position::set_state() const {
 
     st->key               = 0;
@@ -365,6 +398,9 @@ string Position::fen() const {
 }
 
 
+// Calculates st->blockersForKing[c] and st->pinners[~c],
+// which store respectively the pieces preventing king of color c from being in check
+// and the slider pieces of color ~c pinning pieces of color c to the king.
 template<Color c>
 void Position::update_blockers() const {
 
@@ -372,6 +408,7 @@ void Position::update_blockers() const {
     st->blockersForKing[c] = 0;
     st->pinners[~c]        = 0;
 
+    // Snipers are pieces that attack 's' when a piece and other pieces are removed
     Bitboard snipers   = ((attacks_bb(ROOK, ksq) & (pieces(ROOK) | pieces(CANNON) | pieces(KING)))
                           | (attacks_bb(KNIGHT, ksq) & pieces(KNIGHT)))
                        & pieces(~c);
@@ -393,6 +430,8 @@ void Position::update_blockers() const {
 }
 
 
+// Computes a bitboard of all pieces which attack a given square.
+// Slider attacks use the occupied bitboard to indicate occupancy.
 Bitboard Position::attackers_to(Square s, Bitboard occupied) const {
 
     return (attacks_bb(PAWN_TO, s, WHITE) & pieces(WHITE, PAWN))
@@ -405,6 +444,9 @@ Bitboard Position::attackers_to(Square s, Bitboard occupied) const {
 }
 
 
+// Computes a bitboard of all pieces of a given color
+// which gives check to a given square. Slider attacks use the occupied bitboard
+// to indicate occupancy.
 Bitboard Position::checkers_to(Color c, Square s, Bitboard occupied) const {
 
     return ((attacks_bb(PAWN_TO, s, c) & pieces(PAWN))
@@ -415,6 +457,7 @@ Bitboard Position::checkers_to(Color c, Square s, Bitboard occupied) const {
 }
 
 
+// Tests whether a pseudo-legal move is legal
 bool Position::legal(Move m) const {
 
     assert(m.is_ok());
@@ -427,19 +470,29 @@ bool Position::legal(Move m) const {
     assert(color_of(moved_piece(m)) == us);
     assert(piece_on(king_square(us)) == make_piece(us, KING));
 
+    // If the moving piece is a king, check whether the destination square is
+    // attacked by the opponent.
     if (type_of(piece_on(from)) == KING)
         return !(checkers_to(~us, to, occupied));
 
+    // If we don't need full check. A non-king move is always legal when either:
+    // 1. Not moving a pinned piece.
+    // 2. Moving a pinned non-cannon piece and aligned with king.
+    // 3. Moving a pinned cannon and aligned with king but it's not a capture move.
     if (!st->needFullCheck
         && (!(blockers_for_king(us) & from)
             || (((type_of(piece_on(from)) != CANNON) || !capture(m))
                 && aligned(from, to, king_square(us)))))
         return true;
 
+    // A non-king move is legal if the king is not under attack after the move.
     return !(checkers_to(~us, king_square(us), occupied) & ~square_bb(to));
 }
 
 
+// Takes a random move and tests whether the move is
+// pseudo-legal. It is used to validate moves from TT that can be corrupted
+// due to SMP concurrent access or hash position key aliasing.
 bool Position::pseudo_legal(const Move m) const {
 
     Color  us   = sideToMove;
@@ -447,12 +500,16 @@ bool Position::pseudo_legal(const Move m) const {
     Square to   = m.to_sq();
     Piece  pc   = moved_piece(m);
 
+    // If the 'from' square is not occupied by a piece belonging to the side to
+    // move, the move is obviously not legal.
     if (pc == NO_PIECE || color_of(pc) != us)
         return false;
 
+    // The destination square cannot be occupied by a friendly piece
     if (pieces(us) & to)
         return false;
 
+    // Handle the special cases
     if (type_of(pc) == PAWN)
     {
         if (!(attacks_bb(PAWN, from, us) & to))
@@ -473,6 +530,7 @@ bool Position::pseudo_legal(const Move m) const {
 }
 
 
+// Tests whether a pseudo-legal move gives a check
 bool Position::gives_check(Move m) const {
 
     assert(m.is_ok());
@@ -484,6 +542,7 @@ bool Position::gives_check(Move m) const {
 
     PieceType pt = type_of(moved_piece(m));
 
+    // Is there a direct check?
     if (pt == CANNON && (check_squares(ROOK) & from) && aligned(from, to, ksq))
     {
         if (capture(m) && (ray_pass_bb(ksq, from) & to))
@@ -492,6 +551,7 @@ bool Position::gives_check(Move m) const {
     else if (check_squares(pt) & to)
         return true;
 
+    // Is there a discovered check?
     if ((blockers_for_king(~sideToMove) & from) && (!aligned(from, to, ksq) || capture(m)))
         return true;
 
@@ -499,12 +559,17 @@ bool Position::gives_check(Move m) const {
 }
 
 
+// Makes a move, and saves all information necessary
+// to a StateInfo object. The move is assumed to be legal. Pseudo-legal
+// moves should be filtered out before this function is called.
+// If a pointer to the TT table is passed, the entry for the new position
+// will be prefetched, and likewise for shared history.
 void Position::do_move(Move                      m,
                        StateInfo&                newSt,
                        bool                      givesCheck,
                        Dirties&                  dirties,
-                       const TranspositionTable* tt,
-                       const SharedHistories*    history) {
+                       const TranspositionTable* tt      = nullptr,
+                       const SharedHistories*    history = nullptr) {
 
     using namespace Eval::NNUE;
 
@@ -516,11 +581,16 @@ void Position::do_move(Move                      m,
 
     Key k = st->key ^ Zobrist::side;
 
+    // Copy some fields of the old state to our new StateInfo object except the
+    // ones which are going to be recalculated from scratch anyway and then switch
+    // our state pointer to point to the new (ready to be updated) state.
     std::memcpy(&newSt, st, offsetof(StateInfo, key));
     newSt.previous = st;
     st             = &newSt;
     st->move       = m;
 
+    // Increment ply counters. Clamp to 10 checks for each side in rule 60
+    // In particular, rule60 will be reset to zero later on in case of a capture.
     ++gamePly;
     if (!givesCheck || ++st->check10[sideToMove] <= 10)
     {
@@ -553,8 +623,11 @@ void Position::do_move(Move                      m,
     {
         Square capsq = to;
 
+        // If the captured piece is a pawn, update pawn hash key, otherwise
+        // update major material.
         if (type_of(captured) == PAWN)
             st->pawnKey ^= Zobrist::psq[captured][capsq];
+
         else
         {
             st->nonPawnKey[them] ^= Zobrist::psq[captured][capsq];
@@ -570,18 +643,23 @@ void Position::do_move(Move                      m,
         dp.remove_pc = captured;
         dp.remove_sq = capsq;
 
+        // Update hash key
         k ^= Zobrist::psq[captured][capsq];
 
+        // Reset rule 60 counter
         st->check10[WHITE] = st->check10[BLACK] = st->rule60 = 0;
     }
     else
         dp.remove_sq = SQ_NONE;
 
+    // Update hash key
     k ^= Zobrist::psq[pc][from] ^ Zobrist::psq[pc][to];
     if (tt)
         prefetch(tt->first_entry(adjust_key60(k)));
+    // Update the key with the final value
     st->key = k;
 
+    // If the moving piece is a pawn, update pawn hash key.
     if (type_of(pc) == PAWN)
         st->pawnKey ^= Zobrist::psq[pc][from] ^ Zobrist::psq[pc][to];
     else
@@ -635,17 +713,16 @@ void Position::do_move(Move                      m,
     dp.requires_refresh[us] |= (mirror_before[0] != mirror_after[0]);
     dp.requires_refresh[them] |= (mirror_before[1] != mirror_after[1]);
 
+    // Set capture piece
     st->capturedPiece = captured;
 
-    st->skyCapturedId = idBoard[to];
-    idBoard[to]       = idBoard[from];
-    idBoard[from]     = 0;
-
+    // Calculate checkers bitboard (if move gives check)
     st->checkersBB = givesCheck ? checkers_to(us, king_square(them)) : Bitboard(0);
     assert(givesCheck == bool(checkers_to(us, king_square(them))));
 
     sideToMove = ~sideToMove;
 
+    // Update king attacks used for fast check detection
     set_check_info();
 
     assert(pos_is_ok());
@@ -656,6 +733,8 @@ void Position::do_move(Move                      m,
 }
 
 
+// Unmakes a move. When it returns, the position should
+// be restored to exactly the same state as before the move was made.
 void Position::undo_move(Move m) {
 
     assert(m.is_ok());
@@ -668,20 +747,20 @@ void Position::undo_move(Move m) {
     assert(empty(from));
     assert(type_of(st->capturedPiece) != KING);
 
-    move_piece(to, from);
-
-    idBoard[from] = idBoard[to];
-    idBoard[to]   = st->skyCapturedId;
+    move_piece(to, from);  // Put the piece back at the source square
 
     if (st->capturedPiece)
     {
         Square capsq = to;
-        put_piece(st->capturedPiece, capsq);
+
+        put_piece(st->capturedPiece, capsq);  // Restore the captured piece
     }
 
+    // Finally point our state pointer back to the previous state
     st = st->previous;
     --gamePly;
 
+    // Update the bloom filter
     --filter[st->key];
 
     assert(pos_is_ok());
@@ -704,6 +783,7 @@ void Position::update_piece_threats(Piece pc, bool putPiece, Square s, DirtyThre
     const Bitboard rAttacks = attacks_bb(ROOK, s, occupied);
     const Bitboard cAttacks = attacks_bb(CANNON, s, occupied);
 
+    // Outgoing threats
     Bitboard threatened;
 
     switch (type_of(pc))
@@ -735,6 +815,7 @@ void Position::update_piece_threats(Piece pc, bool putPiece, Square s, DirtyThre
         add_dirty_threat(dts, putPiece, pc, threatenedPc, s, threatenedSq);
     }
 
+    // Incoming threats
     Bitboard incoming_threats = (attacks_bb(PAWN_TO, s, WHITE) & pieces(WHITE, PAWN))
                               | (attacks_bb(PAWN_TO, s, BLACK) & pieces(BLACK, PAWN))
                               | (attacks_bb(KNIGHT_TO, s, occupied) & pieces(KNIGHT))
@@ -742,8 +823,10 @@ void Position::update_piece_threats(Piece pc, bool putPiece, Square s, DirtyThre
                               | (attacks_bb(ADVISOR, s) & pieces(ADVISOR))
                               | (attacks_bb(KING, s) & pieces(KING));
 
+    // Discovered threats
     if constexpr (ComputeRay)
     {
+        // Rooks threat pieces on the other side
         Bitboard sliders = rAttacks & pieces(ROOK);
         while (sliders)
         {
@@ -762,12 +845,14 @@ void Position::update_piece_threats(Piece pc, bool putPiece, Square s, DirtyThre
 
             add_dirty_threat(dts, putPiece, slider, pc, sliderSq, s);
         }
+        // Cannons threat pieces on the other side
         sliders = cAttacks & pieces(CANNON);
         while (sliders)
         {
             Square sliderSq = pop_lsb(sliders);
             Piece  slider   = piece_on(sliderSq);
 
+            // Jumping over the first piece before 's'
             const Bitboard discovered = ray_pass_bb(sliderSq, s) & rAttacks & occupied;
 
             assert(!more_than_one(discovered));
@@ -786,6 +871,7 @@ void Position::update_piece_threats(Piece pc, bool putPiece, Square s, DirtyThre
             Square sliderSq = pop_lsb(sliders);
             Piece  slider   = piece_on(sliderSq);
 
+            // Jumping over 's'
             Bitboard discovered = ray_pass_bb(sliderSq, s) & rAttacks & occupied;
 
             assert(!more_than_one(discovered));
@@ -796,6 +882,7 @@ void Position::update_piece_threats(Piece pc, bool putPiece, Square s, DirtyThre
                 add_dirty_threat(dts, putPiece, slider, threatenedPc, sliderSq, threatenedSq);
             }
 
+            // Jumping over the first piece after 's'
             discovered = ray_pass_bb(sliderSq, s) & cAttacks & occupied;
 
             assert(!more_than_one(discovered));
@@ -803,10 +890,12 @@ void Position::update_piece_threats(Piece pc, bool putPiece, Square s, DirtyThre
             {
                 const Square threatenedSq = lsb(discovered);
                 const Piece  threatenedPc = piece_on(threatenedSq);
-                add_dirty_threat(dts, putPiece, slider, threatenedPc, sliderSq, threatenedSq);
+                add_dirty_threat(dts, !putPiece, slider, threatenedPc, sliderSq, threatenedSq);
             }
         }
 
+        // Knights with 's' in between threat pieces on the other side
+        // Bishops with 's' in between threat pieces on the other side
         Bitboard leapers = (unconstrained_attacks_bb(KING, s) & pieces(KNIGHT))
                          | (unconstrained_attacks_bb(ADVISOR, s) & pieces(BISHOP));
         while (leapers)
@@ -857,11 +946,14 @@ Key Position::prefetch_key(Move m) const {
 }
 
 
+// Used to do a "null move": it flips
+// the side to move without executing any move on the board.
 void Position::do_null_move(StateInfo& newSt) {
 
     assert(!checkers());
     assert(&newSt != st);
 
+    // Update the bloom filter
     ++filter[st->key];
 
     std::memcpy(&newSt, st, sizeof(StateInfo));
@@ -883,6 +975,7 @@ void Position::do_null_move(StateInfo& newSt) {
 }
 
 
+// Must be used to undo a "null move"
 void Position::undo_null_move() {
 
     assert(!checkers());
@@ -890,10 +983,14 @@ void Position::undo_null_move() {
     st         = st->previous;
     sideToMove = ~sideToMove;
 
+    // Update the bloom filter
     --filter[st->key];
 }
 
 
+// Tests if the SEE (Static Exchange Evaluation)
+// value of the move is greater or equal to the given threshold. We'll use an
+// algorithm similar to alpha-beta pruning with a null window.
 bool Position::see_ge(Move m, int threshold) const {
 
     assert(m.is_ok());
@@ -911,10 +1008,11 @@ bool Position::see_ge(Move m, int threshold) const {
         return true;
 
     assert(color_of(piece_on(from)) == sideToMove);
-    Bitboard occupied  = pieces() ^ from ^ to;
+    Bitboard occupied  = pieces() ^ from ^ to;  // xoring to is important for pinned piece logic
     Color    stm       = sideToMove;
     Bitboard attackers = attackers_to(to, occupied);
 
+    // Flying general
     bool kingAttacks = attackers & pieces(KING);
     if (kingAttacks)
         attackers |= attacks_bb(ROOK, to, occupied) & pieces(KING);
@@ -929,9 +1027,12 @@ bool Position::see_ge(Move m, int threshold) const {
         stm = ~stm;
         attackers &= occupied;
 
+        // If stm has no more attackers then give up: stm loses
         if (!(stmAttackers = attackers & pieces(stm)))
             break;
 
+        // Don't allow pinned pieces to attack as long as there are
+        // pinners on their original square.
         if (pinners(~stm) & occupied)
         {
             stmAttackers &= ~blockers_for_king(stm);
@@ -942,6 +1043,8 @@ bool Position::see_ge(Move m, int threshold) const {
 
         res ^= 1;
 
+        // Locate and remove the next least valuable attacker, and add to the
+        // bitboard 'attackers' any protential attackers when it is removed.
         if ((bb = stmAttackers & pieces(PAWN)))
         {
             if ((swap = PawnValue - swap) < res)
@@ -999,7 +1102,9 @@ bool Position::see_ge(Move m, int threshold) const {
             attackers = nonCannons | cannons;
         }
 
-        else
+        else  // KING
+              // If we "capture" with the king but the opponent still has attackers,
+              // reverse the result.
             return (attackers & ~pieces(stm)) ? res ^ 1 : res;
     }
 
@@ -1007,6 +1112,7 @@ bool Position::see_ge(Move m, int threshold) const {
 }
 
 
+// A lighter version of do_move(), used in chasing detection
 std::pair<Piece, int> Position::do_move(Move m) {
 
     assert(capture(m));
@@ -1016,9 +1122,11 @@ std::pair<Piece, int> Position::do_move(Move m) {
     Piece  captured = piece_on(to);
     int    id       = idBoard[to];
 
+    // Update id board
     idBoard[to]   = idBoard[from];
     idBoard[from] = 0;
 
+    // Update board and piece lists
     remove_piece(to);
     move_piece(from, to);
 
@@ -1028,6 +1136,7 @@ std::pair<Piece, int> Position::do_move(Move m) {
 }
 
 
+// A lighter version of undo_move(), used in chasing detection
 void Position::undo_move(Move m, Piece captured, int id) {
 
     sideToMove = ~sideToMove;
@@ -1035,16 +1144,21 @@ void Position::undo_move(Move m, Piece captured, int id) {
     Square from = m.from_sq();
     Square to   = m.to_sq();
 
+    // Put back id board
     idBoard[from] = idBoard[to];
     idBoard[to]   = id;
 
-    move_piece(to, from);
+    move_piece(to, from);  // Put the piece back at the source square
 
     if (captured)
-        put_piece(captured, to);
+        put_piece(captured, to);  // Restore the captured piece
 }
 
 
+// Tests whether a pseudo-legal move is chase legal.
+// The extra bitboard b masks out checkers that should be ignored (e.g. the
+// pre-existing checkers on our own king), so that we only flag moves that
+// create NEW attacks on the king. Ported from the "perfect Asian rule" reference.
 bool Position::chase_legal(Move m, Bitboard b) const {
 
     assert(m.is_ok());
@@ -1057,17 +1171,29 @@ bool Position::chase_legal(Move m, Bitboard b) const {
     assert(color_of(moved_piece(m)) == us);
     assert(piece_on(king_square(us)) == make_piece(us, KING));
 
+    // If the moving piece is a king, check whether the destination
+    // square is not under new attack after the move.
     if (type_of(piece_on(from)) == KING)
         return !(checkers_to(~us, to, occupied) & ~b);
 
+    // A non-king move is chase legal if the king is not under new attack after the move.
     return !((checkers_to(~us, king_square(us), occupied) & ~square_bb(to)) & ~b);
 }
 
 
+// Calculates the exact SkyRule attacker -> victim relation for a given color.
+// Unlike chased(), this keeps the attacker's identity. The supplied SkyRule
+// binary stores both the victim union and the chaser union for each historical move.
+// Shares the same chase_legal(m, b) primitive and the same checkUs/checkThem
+// semantics as chased(), so the "常捉无根子" detection stays consistent across rules.
 SkyChaseMap Position::sky_chased(Color c) {
 
     SkyChaseMap chase;
 
+    // Checkers bitboard for both sides, computed before the sideToMove swap so
+    // that the semantics match chased(): checkUs is c's checker state, checkThem
+    // is c's checking state. Passed to the shared chase_legal(m, b) so it only
+    // flags moves that create NEW attacks on the king.
     Bitboard checkUs   = st->checkersBB;
     Bitboard checkThem = checkers_to(sideToMove, king_square(~sideToMove));
     if (c != sideToMove)
@@ -1145,6 +1271,12 @@ SkyChaseMap Position::sky_chased(Color c) {
 }
 
 
+// Calculates the chase information for a given color.
+// Returns a ChaseMap that encodes (victim, attacker) id pairs, so that the
+// perpetual-chase accumulation in detect_chases can correctly verify that the
+// SAME attacker keeps chasing the SAME victim across the repetition cycle.
+// This is the shared "常捉无根子" detector used by AsianRule, SkyRule and YitianRule;
+// each rule still applies its own scoring on top of the resulting victim mask.
 ChaseMap Position::chased(Color c) {
 
     ChaseMap chase;
@@ -1152,6 +1284,9 @@ ChaseMap Position::chased(Color c) {
     if (st->move == Move::none())
         return chase;
 
+    // Checkers bitboard for both sides. checkUs is c's checker state, checkThem
+    // is c's checking state. Passed to the shared chase_legal(m, b) so it only
+    // flags moves that create NEW attacks on the king.
     Bitboard checkUs   = st->checkersBB;
     Bitboard checkThem = checkers_to(sideToMove, king_square(~sideToMove));
     if (c != sideToMove)
@@ -1159,6 +1294,7 @@ ChaseMap Position::chased(Color c) {
 
     std::swap(c, sideToMove);
 
+    // King and pawn can legally perpetual chase.
     Bitboard attackers = pieces(sideToMove) ^ pieces(sideToMove, KING, PAWN);
     while (attackers)
     {
@@ -1166,12 +1302,15 @@ ChaseMap Position::chased(Color c) {
         PieceType attackerType = type_of(piece_on(from));
         Bitboard  attacks      = attacks_bb(attackerType, from, pieces());
 
+        // Restrict to pinners if pinned, otherwise exclude attacks on unpromoted pawns and checks.
         if (blockers_for_king(sideToMove) & from)
             attacks &= pinners(~sideToMove) & ~pieces(KING);
         else
             attacks &= (pieces(~sideToMove) ^ pieces(~sideToMove, KING, PAWN))
                      | (pieces(~sideToMove, PAWN) & HalfBB[sideToMove]);
 
+        // Protected rooks chased by a knight/cannon count directly. ChineseRule and SkyRule
+        // additionally treat advisor/bishop attacks on stronger pieces as a chase.
         Bitboard candidates = 0;
         if (attackerType == KNIGHT || attackerType == CANNON)
             candidates = attacks & pieces(~sideToMove, ROOK);
@@ -1186,6 +1325,7 @@ ChaseMap Position::chased(Color c) {
                 chase |= make_chase(idBoard[to], idBoard[from]);
         }
 
+        // Attacks against potentially unprotected pieces.
         while (attacks)
         {
             Square to = pop_lsb(attacks);
@@ -1209,6 +1349,7 @@ ChaseMap Position::chased(Color c) {
 
                 if (trueChase)
                 {
+                    // Exclude mutual/symmetric attacks except pins.
                     if (attackerType == type_of(piece_on(to)))
                     {
                         sideToMove = ~sideToMove;
@@ -1230,6 +1371,8 @@ ChaseMap Position::chased(Color c) {
 }
 
 
+// Calculates whether the side to move has a forced checking mate threat within the configured depth.
+// This is used only by ChineseRule.
 bool Position::has_mate_threat(Depth d) {
 
     if (d == -1)
@@ -1271,7 +1414,14 @@ bool Position::has_mate_threat(Depth d) {
 }
 
 
-void Position::init_sky_ids() {
+// Fills the SkyRule state carried by each move while rolling the current line back.
+// This mirrors the supplied custom executable: check and chase are classified as mutually
+// exclusive move types; checking moves use victims=0xffff and keep checker identities,
+// while non-checking moves store the exact newly-created victim/chaser relation.
+void Position::set_sky_info(int d) {
+
+    // Reassign compact per-color identities in the current position. A repetition cycle
+    // cannot contain a capture, therefore these identities remain stable while we roll it back.
     int whiteId = 0, blackId = 0;
     std::fill(std::begin(idBoard), std::end(idBoard), 0);
     Bitboard occupied = pieces();
@@ -1279,203 +1429,267 @@ void Position::init_sky_ids() {
         Square sq = pop_lsb(occupied);
         idBoard[sq] = (color_of(board[sq]) == WHITE) ? whiteId++ : blackId++;
     }
+
+    for (int i = 0; i < d && st && st->previous; ++i)
+    {
+        StateInfo* cur = st;
+        if (cur->capturedPiece != NO_PIECE)
+            break;
+
+        cur->skyVictims  = 0;
+        cur->skyCheckers = 0;
+        cur->skyChasers  = 0;
+
+        const Color mover = ~sideToMove;
+
+        // In the target SkyRule, a checking move is not simultaneously counted as a chase.
+        if (cur->checkersBB)
+        {
+            cur->skyVictims = 0xFFFF;
+            Bitboard checks = cur->checkersBB;
+            while (checks)
+            {
+                Square sq = pop_lsb(checks);
+                int id = idBoard[sq];
+                if (id >= 0 && id < 16)
+                    cur->skyCheckers |= u16(1u << id);
+            }
+
+            undo_move(cur->move, cur->capturedPiece, 0);
+            st = cur->previous;
+            continue;
+        }
+
+        // Mate-threat ("kill") recursion is deliberately absent for SkyRule. The supplied
+        // executable short-circuits that detector when the independent Sky flag is enabled.
+        SkyChaseMap after = sky_chased(mover);
+        undo_move(cur->move, cur->capturedPiece, 0);
+        st = cur->previous;
+        SkyChaseMap before = sky_chased(mover);
+        SkyChaseMap exact  = after.exact_diff(before);
+        cur->skyVictims = exact.victims();
+        cur->skyChasers = exact.chasers();
+    }
 }
 
 
+// SkyRule repetition classifier lifted from the state machine shape of the supplied custom
+// executable. A and B are the two alternating movers in the repetition cycle. The primary
+// decision uses three per-move masks (victims/checkers/chasers), not independent 7/13/19
+// streak counters and not a whole-history offense score.
 Value Position::detect_sky_cycle(int d, int ply) {
 
     if (d < 4 || !st)
         return VALUE_DRAW;
 
-    d = std::min(d, 128);
-
     const Color currentSide = sideToMove;
     StateInfo* const start = st;
 
-    // 1. Determine safe history depth (no captures)
-    int historyDepth = std::min(start->pliesFromNull, 128);
-    std::array<StateInfo*, 128> hist{};
-    int hSize = 0;
-    for (StateInfo* p = start; p && p->previous && hSize < historyDepth; p = p->previous) {
+    set_sky_info(d);
+
+    // 1. 使用 Stack Array 收集歷史 StateInfo (修復舊程式碼重複迴圈與 push_back 的錯誤)
+    std::array<StateInfo*, 128> q;
+    int qSize = 0;
+    for (StateInfo* p = start; p && p->previous && qSize < d; p = p->previous) {
         if (p->capturedPiece != NO_PIECE) break;
-        hist[hSize++] = p;
+        q[qSize++] = p;
     }
-    if (hSize < d)
+    if (qSize < d)
         return VALUE_DRAW;
-    historyDepth = hSize;
 
-    // 將老將判定邏輯完全還原為引擎 2 (position-originalenhanced.cpp) 的版本
-    auto current_piece_type = [&](const StateInfo* sm) {
-        if (!sm || !sm->move.is_ok())
-            return NO_PIECE_TYPE;
-        Move m = sm->move;
-        Square to = m.to_sq();
-        Piece pc = piece_on(to);
-        return pc == NO_PIECE ? NO_PIECE_TYPE : type_of(pc);
-    };
+    // 2. 宣告 snapshot 變數與標記，但不在此處直接做 memcpy
+    Position deepRollback;
+    bool deepRollbackCopied = false;
 
-    PieceType s0_type = current_piece_type(hist[0]);
-    PieceType s1_type = current_piece_type(hist[1]);
+    std::vector<StateInfo*> deepQ;
+    auto ensure_deep_history = [&]() -> const std::vector<StateInfo*>& {
+        if (!deepQ.empty())
+            return deepQ;
 
-    // Local arrays for evaluating without mutating shared StateInfo
-    std::array<u16, 128> v_skyVictims{};
-    std::array<u16, 128> v_skyCheckers{};
-    std::array<u16, 128> v_skyChasers{};
-    std::array<bool, 128> v_checked{};
-
-    init_sky_ids();
-
-    int processedPlies = 0;
-    auto evaluate_plies = [&](int targetDepth) {
-        while (processedPlies < targetDepth) {
-            StateInfo* cur = hist[processedPlies];
-            const Color mover = ~sideToMove;
-            v_checked[processedPlies] = bool(cur->checkersBB);
-
-            if (cur->checkersBB) {
-                v_skyVictims[processedPlies] = 0xFFFF;
-                Bitboard checks = cur->checkersBB;
-                while (checks) {
-                    Square sq = pop_lsb(checks);
-                    int id = idBoard[sq];
-                    if (id >= 0 && id < 16)
-                        v_skyCheckers[processedPlies] |= u16(1u << id);
-                }
-                undo_move(cur->move, cur->capturedPiece, 0);
-                st = cur->previous;
-            } else {
-                SkyChaseMap after = sky_chased(mover);
-                undo_move(cur->move, cur->capturedPiece, 0);
-                st = cur->previous;
-                SkyChaseMap before = sky_chased(mover);
-                SkyChaseMap exact = after.exact_diff(before);
-                v_skyVictims[processedPlies] = exact.victims();
-                v_skyChasers[processedPlies] = exact.chasers();
-            }
-            processedPlies++;
+        // 【關鍵優化】：只有當搜尋樹真正走到需要深層歷史判斷（呼叫 ensure_deep_history）時，才觸發 memcpy
+        if (!deepRollbackCopied) {
+            std::memcpy((void*) &deepRollback, (const void*) this, offsetof(Position, filter));
+            std::memcpy((void*) deepRollback.idBoard, (const void*) idBoard, sizeof(idBoard));
+            deepRollbackCopied = true;
         }
+
+        const int historyDepth = std::min(start->pliesFromNull, 128);
+        deepRollback.set_sky_info(std::max(d, historyDepth));
+        deepQ.reserve(historyDepth);
+        for (StateInfo* p = start; p && p->previous && int(deepQ.size()) < historyDepth;
+             p = p->previous)
+        {
+            if (p->capturedPiece != NO_PIECE)
+                break;
+            deepQ.push_back(p);
+        }
+        return deepQ;
     };
 
-    // Evaluate the immediate cycle
-    evaluate_plies(d);
-
+    auto checked = [](const StateInfo* s) { return bool(s->checkersBB); };
     auto loss_for = [&](Color offender) {
         return offender == currentSide ? mated_in(ply) : mate_in(ply);
     };
 
+    // A made moves 0,2,4,... and is the opponent of the side to move now.
     const Color AColor = ~currentSide;
     const Color BColor = currentSide;
 
-    u16 A = v_skyVictims[0] & v_skyVictims[2];
-    u16 B = v_skyVictims[1] & v_skyVictims[3];
+    const StateInfo* s0 = q[0];
+    const StateInfo* s1 = q[1];
+    const StateInfo* s2 = q[2];
+    const StateInfo* s3 = q[3];
 
-    const bool splitA = v_skyVictims[0] && v_skyVictims[2] && A == 0;
-    const bool splitB = v_skyVictims[1] && v_skyVictims[3] && B == 0;
-    const bool checkIdleA = (v_checked[0] && v_skyVictims[2] == 0) || (v_checked[2] && v_skyVictims[0] == 0);
-    const bool checkIdleB = (v_checked[1] && v_skyVictims[3] == 0) || (v_checked[3] && v_skyVictims[1] == 0);
+    u16 A = s0->skyVictims & s2->skyVictims;
+    u16 B = s1->skyVictims & s3->skyVictims;
 
-    const bool mixedA = A && (v_checked[0] != v_checked[2]);
-    const bool mixedB = B && (v_checked[1] != v_checked[3]);
-    const bool differentA = mixedA && ((v_skyChasers[2] & u16(~v_skyCheckers[0])) || (v_skyChasers[0] & u16(~v_skyCheckers[2])));
-    const bool differentB = mixedB && ((v_skyChasers[3] & u16(~v_skyCheckers[1])) || (v_skyChasers[1] & u16(~v_skyCheckers[3])));
+    const bool splitA = s0->skyVictims && s2->skyVictims && A == 0;
+    const bool splitB = s1->skyVictims && s3->skyVictims && B == 0;
+    const bool checkIdleA = (checked(s0) && s2->skyVictims == 0)
+                         || (checked(s2) && s0->skyVictims == 0);
+    const bool checkIdleB = (checked(s1) && s3->skyVictims == 0)
+                         || (checked(s3) && s1->skyVictims == 0);
 
-    for (int i = 4; i < d; i += 2) {
-        A &= v_skyVictims[i];
+    const bool mixedA = A && (checked(s0) != checked(s2));
+    const bool mixedB = B && (checked(s1) != checked(s3));
+    const bool differentA = mixedA
+      && ((s2->skyChasers & u16(~s0->skyCheckers))
+          || (s0->skyChasers & u16(~s2->skyCheckers)));
+    const bool differentB = mixedB
+      && ((s3->skyChasers & u16(~s1->skyCheckers))
+          || (s1->skyChasers & u16(~s3->skyCheckers)));
+
+    // Intersect the victim sets for every move by the same side inside the exact cycle.
+    for (int i = 4; i < d; i += 2)
+    {
+        A &= q[i]->skyVictims;
         if (i + 1 < d)
-            B &= v_skyVictims[i + 1];
+            B &= q[i + 1]->skyVictims;
     }
 
-    // Fast Path 1: 無公共受害者
-    if (!A && !B) {
-        if (splitA && checkIdleB && s0_type != KING) return loss_for(AColor);
-        if (splitB && checkIdleA && s1_type != KING) return loss_for(BColor);
+    // Fast Path 1: 無公共受害者，直接 return，完全不會觸發 memcpy
+    if (!A && !B)
+    {
+        auto current_piece_type = [&](const StateInfo* sm) {
+            Move m = sm->move;
+            if (!m.is_ok())
+                return NO_PIECE_TYPE;
+            Square to = m.to_sq();
+            Piece pc = piece_on(to);
+            return pc == NO_PIECE ? NO_PIECE_TYPE : type_of(pc);
+        };
+
+        if (splitA && checkIdleB && current_piece_type(s0) != KING)
+            return loss_for(AColor);
+        if (splitB && checkIdleA && current_piece_type(s1) != KING)
+            return loss_for(BColor);
         return VALUE_DRAW;
     }
 
-    // Fast Path 2: 單方純長捉
-    if (A && !B) return loss_for(AColor);
-    if (!A && B) return loss_for(BColor);
+    // Fast Path 2: 單方純長捉，直接判裁，完全不會觸發 memcpy
+    if (A && !B)
+        return loss_for(AColor);
+    if (!A && B)
+        return loss_for(BColor);
 
-    // Fast Path 3: 異身混合將捉
-    if (mixedA && !mixedB && differentA) return loss_for(AColor);
-    if (!mixedA && mixedB && differentB) return loss_for(BColor);
+    // Fast Path 3: 異身混合將捉，直接判裁，完全不會觸發 memcpy
+    if (mixedA && !mixedB && differentA)
+        return loss_for(BColor);
+    if (!mixedA && mixedB && differentB)
+        return loss_for(AColor);
 
-    // Slow Path 1: 一將一捉對純長捉（精準判定多子身份與最舊走法相位）
-    if (mixedA != mixedB) {
-        evaluate_plies(historyDepth);
-
+    // Slow Path 1: 一方為一將一捉（mixed），另一方為純長捉（pure）
+    if (mixedA != mixedB)
+    {
         const Color mixedColor = mixedA ? AColor : BColor;
         const Color pureColor  = mixedA ? BColor : AColor;
-        const int   parity     = mixedA ? 0 : 1;
-        const u16   common     = mixedA ? A : B;
+        const int parity       = mixedA ? 0 : 1;
+        const u16 common       = mixedA ? A : B;
 
-        int  count          = 0;
-        u16  identities     = 0;
+        const auto& hist = ensure_deep_history(); // 完美觸發 originalversion 的延遲拷貝機制
+        int count = 0;
+        u16 identities = 0;
         bool oldestWasCheck = false;
-
-        for (int i = parity; i < historyDepth; i += 2) {
-            if (v_checked[i]) {
-                identities |= v_skyCheckers[i];
+        
+        for (int i = parity; i < int(hist.size()); i += 2)
+        {
+            StateInfo* x = hist[i];
+            if (checked(x))
+            {
+                identities |= x->skyCheckers;
                 oldestWasCheck = true;
-            } else if (v_skyVictims[i] & common) {
-                identities |= v_skyChasers[i];
-                oldestWasCheck = false;
-            } else {
-                break;
             }
+            else if (x->skyVictims & common)
+            {
+                identities |= x->skyChasers;
+                oldestWasCheck = false;
+            }
+            else
+                break;
             ++count;
         }
 
-        // 依天規六步身份閾值：當攻擊方累計達6步且涉及多個棋子身份時，視為限制較少的一方，改判純長捉方變招
+        // 2. 多子身分放寬 (Multi-identity relaxation)
+        // 若在 6 回合內涉及多個棋子輪流將/捉，限制等級低於單子純長捉，純長捉方判負變招
         if (count >= 6 && (identities & u16(identities - 1)))
             return loss_for(pureColor);
-
+            
+        // 1. 相位追蹤 (Phase Tracking)
+        // 回溯歷史找序列起點，誰先發起並封閉了循環迴路誰就變招
         return loss_for(oldestWasCheck ? mixedColor : pureColor);
     }
 
-    // Fast Path 4: 雙方皆混合將捉
-    if (mixedA && mixedB) {
-        const bool phaseB = (v_checked[1] && v_skyChasers[0]) || (v_checked[3] && v_skyChasers[2]);
+    // Fast Path 4: 雙方皆混合將捉，直接解相位，不觸發 memcpy
+    if (mixedA && mixedB)
+    {
+        const bool phaseB = (checked(s1) && s0->skyChasers)
+                         || (checked(s3) && s2->skyChasers);
         return phaseB ? loss_for(BColor) : loss_for(AColor);
     }
 
-    // Slow Path 2: 延伸歷史檢查
     auto extended_multi = [&](Color side, u16 commonVictims) {
-        evaluate_plies(historyDepth);
-
+        const auto& hist = ensure_deep_history(); // Slow Path 2: 這裡也會呼叫 ensure_deep_history()
         int count = 0;
         u16 identities = 0;
-        int startIdx = (side == AColor) ? 0 : 1;
-        
-        for (int i = startIdx; i < historyDepth; i += 2) {
-            if (v_checked[i]) {
-                identities |= v_skyCheckers[i];
-            } else {
-                if (!(v_skyVictims[i] & commonVictims)) break;
-                identities |= v_skyChasers[i];
+        for (int i = side == AColor ? 0 : 1; i < int(hist.size()); i += 2)
+        {
+            StateInfo* x = hist[i];
+            if (checked(x))
+                identities |= x->skyCheckers;
+            else
+            {
+                if (!(x->skyVictims & commonVictims))
+                    break;
+                identities |= x->skyChasers;
             }
             ++count;
-            if (count >= 6 && (identities & u16(identities - 1))) return true;
+            if (count >= 6 && (identities & u16(identities - 1)))
+                return true;
         }
         return false;
     };
 
     const bool multiA = extended_multi(AColor, A);
     const bool multiB = extended_multi(BColor, B);
-    if (multiA != multiB) return loss_for(multiA ? BColor : AColor);
+    if (multiA != multiB)
+        return loss_for(multiA ? BColor : AColor);
 
     return VALUE_DRAW;
 }
 
 
+// Detects chases from state st - d to state st.
 Value Position::detect_chases(int d, int ply) {
 
     using RR = RuleConfig::RepetitionRule;
 
+    // AllowChase only forbids perpetual check; this function is called for a non-checking cycle.
+    // NoJudgement does not assign blame for a cycle.
     if (RuleConfig::repetitionRule == RR::ALLOW_CHASE
         || RuleConfig::repetitionRule == RR::NO_JUDGEMENT)
         return VALUE_DRAW;
 
+    // Grant each piece on board a unique id for each side.
     int whiteId = 0;
     int blackId = 0;
     for (Square s = SQ_A0; s <= SQ_I9; ++s)
@@ -1484,6 +1698,7 @@ Value Position::detect_chases(int d, int ply) {
 
     Color us = sideToMove, them = ~us;
 
+    // ComputerRule keeps the current strict detector.
     if (RuleConfig::repetitionRule == RR::COMPUTER)
     {
         u16 chase[COLOR_NB] = {0xFFFF, 0xFFFF};
@@ -1511,12 +1726,18 @@ Value Position::detect_chases(int d, int ply) {
                                                    : VALUE_DRAW;
     }
 
+    // Asian/Chinese/Sky/Yitian use the 2-fold chase classifier. ChineseRule and
+    // SkyRule share the "all pieces simultaneously" semantics. The chase diff is
+    // computed with ChaseMap (victim, attacker) pairs so that a victim chased by
+    // a different attacker is not confused with a continued chase by the original
+    // attacker (the "带根长捉" fix shared by all three rules). The accumulated
+    // victim mask is then consumed by each rule's own scoring below.
     const bool chineseLike = RuleConfig::chinese_like();
     const bool chineseRule = RuleConfig::repetitionRule == RR::CHINESE;
 
     u16      rooks[COLOR_NB] = {0xFFFF, 0xFFFF};
-    u16      chase[COLOR_NB] = {0xFFFF, 0xFFFF};
-    ChaseMap newChase[COLOR_NB];
+    u16      chase[COLOR_NB] = {0xFFFF, 0xFFFF};  // u16 victim-mask intersection accumulation
+    ChaseMap newChase[COLOR_NB];                  // ChaseMap (victim, attacker) per side
     newChase[us] = chased(us);
 
     for (int i = 0; i < d; ++i)
@@ -1531,6 +1752,7 @@ Value Position::detect_chases(int d, int ply) {
         else if (st->checkersBB
                  || (chineseRule && RuleConfig::mateThreatDepth > 0 && has_mate_threat()))
         {
+            // In Chinese-like rules, check/mate-threat is treated as chasing all pieces.
             chase[~sideToMove] &= chineseLike ? 0xFFFF : 0;
             rooks[~sideToMove] = 0;
             undo_move(st->move, st->capturedPiece);
@@ -1541,6 +1763,7 @@ Value Position::detect_chases(int d, int ply) {
             ChaseMap oldChase = chased(~sideToMove);
             u16      flag     = 0;
 
+            // Asian-style special case: a rook pinned by a knight may itself be the chased piece.
             if (!chineseLike && rooks[~sideToMove]
                 && (blockers_for_king(sideToMove) & pieces(sideToMove, ROOK)))
             {
@@ -1558,13 +1781,17 @@ Value Position::detect_chases(int d, int ply) {
             undo_move(st->move, st->capturedPiece);
             st = st->previous;
 
+            // ChaseMap diff (victim, attacker): newly created chase pairs for this move.
+            // operator& is an in-place set difference; the (void) cast keeps the side effect
+            // (chases becomes oldChase - newChase) and discards the returned reference.
             ChaseMap chases = oldChase;
             (void)(chases & newChase[sideToMove]);
-            u16      chasesU16    = u16(chases);
+            u16      chasesU16    = u16(chases);  // collapse to victim mask for accumulation
             newChase[sideToMove] = chased(sideToMove);
 
             if (chineseLike)
             {
+                // Chinese-like rules recompute the diff against the updated newChase.
                 chases = oldChase;
                 (void)(chases & newChase[sideToMove]);
                 chasesU16 = u16(chases);
@@ -1588,6 +1815,8 @@ Value Position::detect_chases(int d, int ply) {
 }
 
 
+// Tests whether the position may end the game by rule 60, insufficient material, draw repetition,
+// perpetual check repetition or perpetual chase repetition that allows a player to claim a game result.
 bool Position::rule_judge(Value& result, int ply) {
 
     using RR = RuleConfig::RepetitionRule;
@@ -1603,12 +1832,14 @@ bool Position::rule_judge(Value& result, int ply) {
             winner = BLACK;
         else if (RuleConfig::drawRule == DR::RED_WIN
                  || (repetition && RuleConfig::drawRule == DR::REP_RED_WIN))
-            winner = WHITE;
+            winner = WHITE;  // WHITE is Red in Pikafish's Xiangqi representation.
 
         if (winner != COLOR_NB)
             result = winner == sideToMove ? mate_in(ply) : mated_in(ply);
     };
 
+    // Restore rule 60 by adding back the checks. Captures/null moves still bound the
+    // repetition history even when the natural-move draw itself is disabled.
     int end = std::min(st->rule60 + std::max(0, st->check10[WHITE] - 10)
                          + std::max(0, st->check10[BLACK] - 10),
                        st->pliesFromNull);
@@ -1655,12 +1886,17 @@ bool Position::rule_judge(Value& result, int ply) {
                     const bool judgedDraw = result == VALUE_DRAW;
                     apply_draw_rule(true);
 
+                    // Legacy modes are 2-fold rules. ComputerRule preserves the stricter
+                    // current Pikafish 3-fold/further-investigation behavior.
                     if (RuleConfig::repetitionRule != RR::COMPUTER)
                         return true;
 
+                    // 3 folds and 2-fold draws (including DrawRule-transformed draws)
+                    // can be judged immediately.
                     if (judgedDraw || cnt == 2)
                         return true;
 
+                    // Preserve the current ComputerRule false-mate safeguard.
                     if (filter[st->key] <= 1)
                     {
                         const int maxPly = std::max(1, RuleConfig::rule60MaxPly);
@@ -1683,6 +1919,8 @@ bool Position::rule_judge(Value& result, int ply) {
         }
     }
 
+    // Configurable natural-move rule. Selecting YitianRule turns this off in the UCI callback,
+    // matching the target binary.
     if (RuleConfig::sixtyMoveRule && RuleConfig::rule60MaxPly > 0
         && st->rule60 >= RuleConfig::rule60MaxPly)
     {
@@ -1691,6 +1929,7 @@ bool Position::rule_judge(Value& result, int ply) {
         return true;
     }
 
+    // Draw by insufficient material.
     if (count<PAWN>() == 0)
     {
         enum DrawLevel : int {
@@ -1756,12 +1995,14 @@ bool Position::rule_judge(Value& result, int ply) {
 }
 
 
+// Flips position with the white and black sides reversed. This
+// is only useful for debugging e.g. for finding evaluation symmetry bugs.
 std::optional<PositionSetError> Position::flip() {
 
     string            f, token;
     std::stringstream ss(fen());
 
-    for (Rank r = RANK_9;; --r)
+    for (Rank r = RANK_9;; --r)  // Piece placement
     {
         std::getline(ss, token, r > RANK_0 ? '/' : ' ');
         f.insert(0, token + (f.empty() ? " " : "/"));
@@ -1770,8 +2011,8 @@ std::optional<PositionSetError> Position::flip() {
             break;
     }
 
-    ss >> token;
-    f += (token == "w" ? "B " : "W ");
+    ss >> token;                        // Active color
+    f += (token == "w" ? "B " : "W ");  // Will be lowercased later
 
     ss >> token;
     f += token + " ";
@@ -1782,13 +2023,16 @@ std::optional<PositionSetError> Position::flip() {
     ss >> token;
     f += token;
 
-    std::getline(ss, token);
+    std::getline(ss, token);  // Half and full moves
     f += token;
 
     return set(f, st);
 }
 
 
+// Performs some consistency checks for the position object
+// and raise an assert if something wrong is detected.
+// This is meant to be helpful when debugging.
 bool Position::pos_is_ok() const {
 
     if ((sideToMove != WHITE && sideToMove != BLACK) || piece_on(king_square(WHITE)) != W_KING
