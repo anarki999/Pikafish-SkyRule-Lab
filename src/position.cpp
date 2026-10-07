@@ -20,11 +20,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cctype>
 #include <cstddef>
-#include <initializer_list>
 #include <cstring>
+#include <initializer_list>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -36,8 +37,8 @@
 #include "history.h"
 #include "misc.h"
 #include "movegen.h"
-#include "nnue/nnue_common.h"
 #include "nnue/nnue_architecture.h"
+#include "nnue/nnue_common.h"
 #include "tt.h"
 #include "uci.h"
 
@@ -46,8 +47,6 @@ using std::string;
 namespace Stockfish {
 
 using namespace Attacks;
-
-#include <atomic>
 
 namespace RuleConfig {
 // Defaults: SkyRule with rule120, Sixty Move Rule off.
@@ -76,14 +75,14 @@ static constexpr Piece Pieces[] = {W_ROOK, W_ADVISOR, W_CANNON, W_PAWN, W_KNIGHT
 // Returns an ASCII representation of the position
 std::ostream& operator<<(std::ostream& os, const Position& pos) {
 
-    os << "\n +---+---+---+---+---+---+---+---+---+\n";
+    os << "\n +---+---+---+---+---+---+---+---++\n";
 
     for (Rank r = RANK_9;; --r)
     {
         for (File f = FILE_A; f <= FILE_I; ++f)
             os << " | " << PieceToChar[pos.piece_on(make_square(f, r))];
 
-        os << " | " << int(r) << "\n +---+---+---+---+---+---+---+---+---+\n";
+        os << " | " << int(r) << "\n +---+---+---+---+---+---+---+---++\n";
 
         if (r == RANK_0)
             break;
@@ -115,8 +114,6 @@ void Position::init() {
 
 
 // Initializes the position object with the given FEN string.
-// The FEN string is strictly validated; if it is invalid or inconsistent,
-// a PositionSetError describing the problem is returned, otherwise std::nullopt.
 std::optional<PositionSetError> Position::set(const string& fenStr, StateInfo* si) {
 
     unsigned char     token;
@@ -134,7 +131,7 @@ std::optional<PositionSetError> Position::set(const string& fenStr, StateInfo* s
     // 3. 基礎狀態變數與 BloomFilter 清空
     gamePly = 0;
     sideToMove = WHITE;
-    filter = {}; // 若 BloomFilter 有 reset()，也可寫成 filter.reset();
+    filter = {};
 
     // 4. 初始化傳入的 StateInfo 結點
     std::memset(si, 0, sizeof(StateInfo));
@@ -607,7 +604,6 @@ void Position::do_move(Move                      m,
         prefetch(&history->nonpawn_correction_entry<BLACK>(*this));
     }
 
-    // ==== 這裡是上一版漏掉的 NNUE 神經網絡狀態更新 ====
     bool mirror_before[2] = {
       PSQFeatureSet::KingBuckets[king_square(us)][king_square(them)]
                                 [PSQFeatureSet::requires_mid_mirror(*this, us)]
@@ -641,11 +637,9 @@ void Position::do_move(Move                      m,
                                   .second};
     dp.requires_refresh[us] |= (mirror_before[0] != mirror_after[0]);
     dp.requires_refresh[them] |= (mirror_before[1] != mirror_after[1]);
-    // ===============================================
 
     st->capturedPiece = captured;
 
-    // 天規用：同步 idBoard 映射
     st->skyCapturedId = idBoard[to];
     idBoard[to]       = idBoard[from];
     idBoard[from]     = 0;
@@ -679,7 +673,6 @@ void Position::undo_move(Move m) {
 
     move_piece(to, from);
 
-    // 還原 idBoard 映射
     idBoard[from] = idBoard[to];
     idBoard[to]   = st->skyCapturedId;
 
@@ -1314,8 +1307,18 @@ Value Position::detect_sky_cycle(int d, int ply) {
         return VALUE_DRAW;
     historyDepth = hSize;
 
-    PieceType s0_type = (hist[0] && hist[0]->move.is_ok()) ? type_of(piece_on(hist[0]->move.to_sq())) : NO_PIECE_TYPE;
-    PieceType s1_type = (hist[1] && hist[1]->move.is_ok()) ? type_of(piece_on(hist[1]->move.to_sq())) : NO_PIECE_TYPE;
+    // 將老將判定邏輯完全還原為引擎 2 (position-originalenhanced.cpp) 的版本
+    auto current_piece_type = [&](const StateInfo* sm) {
+        if (!sm || !sm->move.is_ok())
+            return NO_PIECE_TYPE;
+        Move m = sm->move;
+        Square to = m.to_sq();
+        Piece pc = piece_on(to);
+        return pc == NO_PIECE ? NO_PIECE_TYPE : type_of(pc);
+    };
+
+    PieceType s0_type = current_piece_type(hist[0]);
+    PieceType s1_type = current_piece_type(hist[1]);
 
     // Local arrays for evaluating without mutating shared StateInfo
     std::array<u16, 128> v_skyVictims{};
