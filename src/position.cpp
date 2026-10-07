@@ -1217,6 +1217,8 @@ Value Position::detect_sky_cycle(int d, int ply) {
     if (d < 4 || !st)
         return VALUE_DRAW;
 
+    d = std::min(d, 128);
+
     const Color currentSide = sideToMove;
     StateInfo* const start = st;
 
@@ -1260,9 +1262,11 @@ Value Position::detect_sky_cycle(int d, int ply) {
                         v_skyCheckers[processedPlies] |= u16(1u << id);
                 }
                 undo_move(cur->move, cur->capturedPiece, 0);
+                st = cur->previous; // <--- 【修復關鍵 1：同步歷史指針】
             } else {
                 SkyChaseMap after = sky_chased(mover);
                 undo_move(cur->move, cur->capturedPiece, 0);
+                st = cur->previous; // <--- 【修復關鍵 2：同步歷史指針】
                 SkyChaseMap before = sky_chased(mover);
                 SkyChaseMap exact = after.exact_diff(before);
                 v_skyVictims[processedPlies] = exact.victims();
