@@ -20,12 +20,11 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cassert>
 #include <cctype>
 #include <cstddef>
-#include <cstring>
 #include <initializer_list>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -37,8 +36,8 @@
 #include "history.h"
 #include "misc.h"
 #include "movegen.h"
-#include "nnue/nnue_architecture.h"
 #include "nnue/nnue_common.h"
+#include "nnue/nnue_architecture.h"
 #include "tt.h"
 #include "uci.h"
 
@@ -47,6 +46,8 @@ using std::string;
 namespace Stockfish {
 
 using namespace Attacks;
+
+#include <atomic>
 
 namespace RuleConfig {
 // Defaults: SkyRule with rule120, Sixty Move Rule off.
@@ -75,14 +76,14 @@ static constexpr Piece Pieces[] = {W_ROOK, W_ADVISOR, W_CANNON, W_PAWN, W_KNIGHT
 // Returns an ASCII representation of the position
 std::ostream& operator<<(std::ostream& os, const Position& pos) {
 
-    os << "\n +---+---+---+---+---+---+---+---++\n";
+    os << "\n +---+---+---+---+---+---+---+---+---+\n";
 
     for (Rank r = RANK_9;; --r)
     {
         for (File f = FILE_A; f <= FILE_I; ++f)
             os << " | " << PieceToChar[pos.piece_on(make_square(f, r))];
 
-        os << " | " << int(r) << "\n +---+---+---+---+---+---+---+---++\n";
+        os << " | " << int(r) << "\n +---+---+---+---+---+---+---+---+---+\n";
 
         if (r == RANK_0)
             break;
@@ -114,6 +115,8 @@ void Position::init() {
 
 
 // Initializes the position object with the given FEN string.
+// The FEN string is strictly validated; if it is invalid or inconsistent,
+// a PositionSetError describing the problem is returned, otherwise std::nullopt.
 std::optional<PositionSetError> Position::set(const string& fenStr, StateInfo* si) {
 
     unsigned char     token;
@@ -131,7 +134,7 @@ std::optional<PositionSetError> Position::set(const string& fenStr, StateInfo* s
     // 3. 基礎狀態變數與 BloomFilter 清空
     gamePly = 0;
     sideToMove = WHITE;
-    filter = {};
+    filter = {}; // 若 BloomFilter 有 reset()，也可寫成 filter.reset();
 
     // 4. 初始化傳入的 StateInfo 結點
     std::memset(si, 0, sizeof(StateInfo));
@@ -509,80 +512,156 @@ void Position::do_move(Move                      m,
                        const TranspositionTable* tt,
                        const SharedHistories*    history) {
 
+    using namespace Eval::NNUE;
+
     assert(m.is_ok());
     assert(&newSt != st);
 
-    // 1. 基礎狀態維護與 Bloom Filter 更新
+    // Update the bloom filter
     ++filter[st->key];
+
+    Key k = st->key ^ Zobrist::side;
+
     std::memcpy(&newSt, st, offsetof(StateInfo, key));
     newSt.previous = st;
     st             = &newSt;
     st->move       = m;
 
-    // 清空/初始化天規歷史資訊
-    st->skyVictims  = 0;
-    st->skyChasers  = 0;
-    st->skyCheckers = 0;
-
-    // 2. 棋盤走子與 idBoard 維護
-    Square from = m.from_sq();
-    Square to   = m.to_sq();
-    Piece  pc   = piece_on(from);
-    Piece  cap  = piece_on(to);
-
-    st->capturedPiece = cap;
-    st->skyCapturedId = idBoard[to];
-    idBoard[to]       = idBoard[from];
-    idBoard[from]     = 0;
-
-    // 增量步數與規則計數器更新
-    st->rule60 = (cap || type_of(pc) == PAWN) ? 0 : st->rule60 + 1;
-    st->pliesFromNull++;
     ++gamePly;
-
-    // 棋子移動與威脅更新
-    if (cap)
-        remove_piece(to, &dirties.dirtyThreats);
-
-    move_piece(from, to, &dirties.dirtyThreats);
-
-    // Zobrist Hash Key 增量計算
-    st->key ^= Zobrist::side;
-    if (cap)
+    if (!givesCheck || ++st->check10[sideToMove] <= 10)
     {
-        st->key ^= Zobrist::psq[cap][to];
-        if (type_of(cap) == PAWN)
-            st->pawnKey ^= Zobrist::psq[cap][to];
+        if (st->check10[~sideToMove] > 10 && st->previous->checkersBB)
+            ++st->check10[~sideToMove];
+        else
+            ++st->rule60;
+    }
+    ++st->pliesFromNull;
+
+    auto& dts = dirties.dirtyThreats;
+    auto& dp  = dirties.dirtyPiece;
+
+    Color  us       = sideToMove;
+    Color  them     = ~us;
+    Square from     = m.from_sq();
+    Square to       = m.to_sq();
+    Piece  pc       = piece_on(from);
+    Piece  captured = piece_on(to);
+
+    dp.pc   = pc;
+    dp.from = from;
+    dp.to   = to;
+
+    assert(color_of(pc) == us);
+    assert(captured == NO_PIECE || color_of(captured) == them);
+    assert(type_of(captured) != KING);
+
+    if (captured)
+    {
+        Square capsq = to;
+
+        if (type_of(captured) == PAWN)
+            st->pawnKey ^= Zobrist::psq[captured][capsq];
         else
         {
-            st->nonPawnKey[~sideToMove] ^= Zobrist::psq[cap][to];
-            if (type_of(cap) != KING && (type_of(cap) & 1))
+            st->nonPawnKey[them] ^= Zobrist::psq[captured][capsq];
+
+            if (type_of(captured) & 1)
             {
-                st->majorMaterial[~sideToMove] -= PieceValue[cap];
-                if (type_of(cap) != ROOK)
-                    st->minorPieceKey ^= Zobrist::psq[cap][to];
+                st->majorMaterial[them] -= PieceValue[captured];
+                if (type_of(captured) != ROOK)
+                    st->minorPieceKey ^= Zobrist::psq[captured][capsq];
             }
         }
-    }
 
-    st->key ^= Zobrist::psq[pc][from] ^ Zobrist::psq[pc][to];
+        dp.remove_pc = captured;
+        dp.remove_sq = capsq;
+
+        k ^= Zobrist::psq[captured][capsq];
+
+        st->check10[WHITE] = st->check10[BLACK] = st->rule60 = 0;
+    }
+    else
+        dp.remove_sq = SQ_NONE;
+
+    k ^= Zobrist::psq[pc][from] ^ Zobrist::psq[pc][to];
+    if (tt)
+        prefetch(tt->first_entry(adjust_key60(k)));
+    st->key = k;
+
     if (type_of(pc) == PAWN)
         st->pawnKey ^= Zobrist::psq[pc][from] ^ Zobrist::psq[pc][to];
     else
     {
-        st->nonPawnKey[sideToMove] ^= Zobrist::psq[pc][from] ^ Zobrist::psq[pc][to];
-        if (type_of(pc) != KING && (type_of(pc) & 1) && type_of(pc) != ROOK)
+        st->nonPawnKey[us] ^= Zobrist::psq[pc][from] ^ Zobrist::psq[pc][to];
+
+        if (type_of(pc) == KNIGHT || type_of(pc) == CANNON)
             st->minorPieceKey ^= Zobrist::psq[pc][from] ^ Zobrist::psq[pc][to];
     }
 
-    // 切換走子方
+    if (history)
+    {
+        prefetch(&history->pawn_entry(*this)[pc][to]);
+        prefetch(&history->pawn_correction_entry(*this));
+        prefetch(&history->minor_piece_correction_entry(*this));
+        prefetch(&history->nonpawn_correction_entry<WHITE>(*this));
+        prefetch(&history->nonpawn_correction_entry<BLACK>(*this));
+    }
+
+    // ==== 這裡是上一版漏掉的 NNUE 神經網絡狀態更新 ====
+    bool mirror_before[2] = {
+      PSQFeatureSet::KingBuckets[king_square(us)][king_square(them)]
+                                [PSQFeatureSet::requires_mid_mirror(*this, us)]
+                                  .second,
+      PSQFeatureSet::KingBuckets[king_square(them)][king_square(us)]
+                                [PSQFeatureSet::requires_mid_mirror(*this, them)]
+                                  .second};
+    dp.requires_refresh[them] = false;
+    dp.requires_refresh[us]   = pc == make_piece(us, KING);
+
+    if (captured)
+    {
+        auto attack_bucket_before = PSQFeatureSet::make_attack_bucket(*this, them);
+
+        remove_piece(from, &dts);
+        swap_piece(to, pc, &dts);
+
+        auto attack_bucket_after = PSQFeatureSet::make_attack_bucket(*this, them);
+
+        dp.requires_refresh[them] |= (attack_bucket_before != attack_bucket_after);
+    }
+    else
+        move_piece(from, to, &dts);
+
+    bool mirror_after[2] = {
+      PSQFeatureSet::KingBuckets[king_square(us)][king_square(them)]
+                                [PSQFeatureSet::requires_mid_mirror(*this, us)]
+                                  .second,
+      PSQFeatureSet::KingBuckets[king_square(them)][king_square(us)]
+                                [PSQFeatureSet::requires_mid_mirror(*this, them)]
+                                  .second};
+    dp.requires_refresh[us] |= (mirror_before[0] != mirror_after[0]);
+    dp.requires_refresh[them] |= (mirror_before[1] != mirror_after[1]);
+    // ===============================================
+
+    st->capturedPiece = captured;
+
+    // 天規用：同步 idBoard 映射
+    st->skyCapturedId = idBoard[to];
+    idBoard[to]       = idBoard[from];
+    idBoard[from]     = 0;
+
+    st->checkersBB = givesCheck ? checkers_to(us, king_square(them)) : Bitboard(0);
+    assert(givesCheck == bool(checkers_to(us, king_square(them))));
+
     sideToMove = ~sideToMove;
 
-    // 計算將軍狀態與將領威脅格
-    st->checkersBB = givesCheck ? checkers_to(~sideToMove, king_square(sideToMove)) : Bitboard(0);
     set_check_info();
 
     assert(pos_is_ok());
+
+    assert(dp.pc != NO_PIECE);
+    assert(!bool(captured) ^ (dp.remove_sq != SQ_NONE));
+    assert(dp.from != SQ_NONE && dp.to != SQ_NONE);
 }
 
 
@@ -600,6 +679,7 @@ void Position::undo_move(Move m) {
 
     move_piece(to, from);
 
+    // 還原 idBoard 映射
     idBoard[from] = idBoard[to];
     idBoard[to]   = st->skyCapturedId;
 
@@ -988,7 +1068,7 @@ bool Position::chase_legal(Move m, Bitboard b) const {
     assert(piece_on(king_square(us)) == make_piece(us, KING));
 
     if (type_of(piece_on(from)) == KING)
-        return !(checkers_to(~us, to, occupied) & ~b);
+        return !(checkers_to(~us, to, occupied));
 
     return !((checkers_to(~us, king_square(us), occupied) & ~square_bb(to)) & ~b);
 }
@@ -1262,11 +1342,11 @@ Value Position::detect_sky_cycle(int d, int ply) {
                         v_skyCheckers[processedPlies] |= u16(1u << id);
                 }
                 undo_move(cur->move, cur->capturedPiece, 0);
-                st = cur->previous; // <--- 【修復關鍵 1：同步歷史指針】
+                st = cur->previous;
             } else {
                 SkyChaseMap after = sky_chased(mover);
                 undo_move(cur->move, cur->capturedPiece, 0);
-                st = cur->previous; // <--- 【修復關鍵 2：同步歷史指針】
+                st = cur->previous;
                 SkyChaseMap before = sky_chased(mover);
                 SkyChaseMap exact = after.exact_diff(before);
                 v_skyVictims[processedPlies] = exact.victims();
@@ -1532,6 +1612,7 @@ bool Position::rule_judge(Value& result, int ply) {
                     {
                         Position rollback;
                         memcpy((void*) &rollback, (const void*) this, offsetof(Position, filter));
+                        memcpy((void*) rollback.idBoard, (const void*) idBoard, sizeof(idBoard));
                         result = RuleConfig::repetitionRule == RR::SKY
                                ? rollback.detect_sky_cycle(i, ply)
                                : rollback.detect_chases(i, ply);
