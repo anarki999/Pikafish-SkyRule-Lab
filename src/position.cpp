@@ -30,6 +30,7 @@
 #include <sstream>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "attacks.h"
 #include "bitboard.h"
@@ -48,13 +49,15 @@ namespace Stockfish {
 using namespace Attacks;
 
 namespace RuleConfig {
-// Defaults: SkyRule with rule120, Sixty Move Rule off.
-// AsianRule and SkyRule default to rule120 (enforced in engine.cpp couplings).
-RepetitionRule		repetitionRule  = RepetitionRule::SKY;
-DrawRule				drawRule        = DrawRule::NONE;
-int							mateThreatDepth = 10;
-bool						sixtyMoveRule   = false;
-int							rule60MaxPly    = 120;
+// Defaults: YitianRule with rule150, Sixty Move Rule on.
+// AsianRule/SkyRule couple to rule120 and YitianRule couples to rule150;
+// the Sixty Move Rule stays on for all three (enforced in engine.cpp
+// couplings).
+RepetitionRule repetitionRule  = RepetitionRule::SKY;
+DrawRule       drawRule        = DrawRule::NONE;
+int            mateThreatDepth = 10;
+bool           sixtyMoveRule   = true;
+int            rule60MaxPly    = 120;
 }  // namespace RuleConfig
 
 namespace Zobrist {
@@ -140,24 +143,10 @@ std::optional<PositionSetError> Position::set(const string& fenStr, StateInfo* s
       incremented after Black's move.
 */
 
-    unsigned char     token;
+    unsigned char      token;
     std::istringstream ss(fenStr);
 
-    // 1. 棋盤與 Bitboard 重置
-    board.fill(NO_PIECE);
-    byTypeBB.fill(0);
-    byColorBB.fill(0);
-    std::memset(pieceCount, 0, sizeof(pieceCount));
-
-    // 2. Pikafish / 天規 (SkyRule) 專屬欄位重置
-    std::memset(idBoard, 0, sizeof(idBoard));
-
-    // 3. 基礎狀態變數與 BloomFilter 清空
-    gamePly = 0;
-    sideToMove = WHITE;
-    filter = {}; // 若 BloomFilter 有 reset()，也可寫成 filter.reset();
-
-    // 4. 初始化傳入的 StateInfo 結點
+    std::memset(reinterpret_cast<char*>(this), 0, sizeof(Position));
     std::memset(si, 0, sizeof(StateInfo));
     st = si;
 
@@ -222,6 +211,7 @@ std::optional<PositionSetError> Position::set(const string& fenStr, StateInfo* s
 
     if (rank != RANK_0 || file != FILE_NB)
         return PositionSetError("Invalid FEN. Board state encoding ended but cursor not at end.");
+
     if (count<KING>(WHITE) != 1 || count<KING>(BLACK) != 1)
         return PositionSetError("Unsupported position. Incorrect number of kings.");
 
@@ -1155,10 +1145,7 @@ void Position::undo_move(Move m, Piece captured, int id) {
 }
 
 
-// Tests whether a pseudo-legal move is chase legal.
-// The extra bitboard b masks out checkers that should be ignored (e.g. the
-// pre-existing checkers on our own king), so that we only flag moves that
-// create NEW attacks on the king. Ported from the "perfect Asian rule" reference.
+// Tests whether a pseudo-legal move is chase legal
 bool Position::chase_legal(Move m, Bitboard b) const {
 
     assert(m.is_ok());
@@ -1424,11 +1411,9 @@ void Position::set_sky_info(int d) {
     // cannot contain a capture, therefore these identities remain stable while we roll it back.
     int whiteId = 0, blackId = 0;
     std::fill(std::begin(idBoard), std::end(idBoard), 0);
-    Bitboard occupied = pieces();
-    while (occupied) {
-        Square sq = pop_lsb(occupied);
-        idBoard[sq] = (color_of(board[sq]) == WHITE) ? whiteId++ : blackId++;
-    }
+    for (Square sq = SQ_A0; sq <= SQ_I9; ++sq)
+        if (board[sq] != NO_PIECE)
+            idBoard[sq] = color_of(board[sq]) == WHITE ? whiteId++ : blackId++;
 
     for (int i = 0; i < d && st && st->previous; ++i)
     {
@@ -1485,34 +1470,29 @@ Value Position::detect_sky_cycle(int d, int ply) {
     const Color currentSide = sideToMove;
     StateInfo* const start = st;
 
+    // Preserve an untouched rollback snapshot. The normal path classifies only the exact
+    // repetition cycle; only the ambiguous Sky branches pay for older history.
+    Position deepRollback;
+    std::memcpy((void*) &deepRollback, (const void*) this, offsetof(Position, filter));
+    std::memcpy((void*) deepRollback.idBoard, (const void*) idBoard, sizeof(idBoard));
+
     set_sky_info(d);
 
-    // 1. 使用 Stack Array 收集歷史 StateInfo (修復舊程式碼重複迴圈與 push_back 的錯誤)
-    std::array<StateInfo*, 128> q;
-    int qSize = 0;
-    for (StateInfo* p = start; p && p->previous && qSize < d; p = p->previous) {
-        if (p->capturedPiece != NO_PIECE) break;
-        q[qSize++] = p;
+    std::vector<StateInfo*> q;
+    q.reserve(d);
+    for (StateInfo* p = start; p && p->previous && int(q.size()) < d; p = p->previous)
+    {
+        if (p->capturedPiece != NO_PIECE)
+            break;
+        q.push_back(p);
     }
-    if (qSize < d)
+    if (int(q.size()) < d)
         return VALUE_DRAW;
-
-    // 2. 宣告 snapshot 變數與標記，但不在此處直接做 memcpy
-    Position deepRollback;
-    bool deepRollbackCopied = false;
 
     std::vector<StateInfo*> deepQ;
     auto ensure_deep_history = [&]() -> const std::vector<StateInfo*>& {
         if (!deepQ.empty())
             return deepQ;
-
-        // 【關鍵優化】：只有當搜尋樹真正走到需要深層歷史判斷（呼叫 ensure_deep_history）時，才觸發 memcpy
-        if (!deepRollbackCopied) {
-            std::memcpy((void*) &deepRollback, (const void*) this, offsetof(Position, filter));
-            std::memcpy((void*) deepRollback.idBoard, (const void*) idBoard, sizeof(idBoard));
-            deepRollbackCopied = true;
-        }
-
         const int historyDepth = std::min(start->pliesFromNull, 128);
         deepRollback.set_sky_info(std::max(d, historyDepth));
         deepQ.reserve(historyDepth);
@@ -1567,7 +1547,8 @@ Value Position::detect_sky_cycle(int d, int ply) {
             B &= q[i + 1]->skyVictims;
     }
 
-    // Fast Path 1: 無公共受害者，直接 return，完全不會觸發 memcpy
+    // No common victim on either side. The target has one Sky-only exception for a split
+    // chase against check/idle alternation; a king move is explicitly exempt.
     if (!A && !B)
     {
         auto current_piece_type = [&](const StateInfo* sm) {
@@ -1586,19 +1567,22 @@ Value Position::detect_sky_cycle(int d, int ply) {
         return VALUE_DRAW;
     }
 
-    // Fast Path 2: 單方純長捉，直接判裁，完全不會觸發 memcpy
+    // Exactly one side keeps a common victim throughout the cycle: that side is the offender.
     if (A && !B)
         return loss_for(AColor);
     if (!A && B)
         return loss_for(BColor);
 
-    // Fast Path 3: 異身混合將捉，直接判裁，完全不會觸發 memcpy
+    // Both sides are offensive. A check/chase alternation performed by different identities
+    // is less restrictive than the opponent's pure/common-victim offense; the pure side changes.
     if (mixedA && !mixedB && differentA)
         return loss_for(BColor);
     if (!mixedA && mixedB && differentB)
         return loss_for(AColor);
 
-    // Slow Path 1: 一方為一將一捉（mixed），另一方為純長捉（pure）
+    // Same-identity check/chase against a pure common-victim chase is phase-sensitive. The
+    // target extends backward until that mixed sequence starts; if its oldest offensive turn
+    // is a check, the mixed side closes the forbidden loop first, otherwise the pure side does.
     if (mixedA != mixedB)
     {
         const Color mixedColor = mixedA ? AColor : BColor;
@@ -1606,11 +1590,10 @@ Value Position::detect_sky_cycle(int d, int ply) {
         const int parity       = mixedA ? 0 : 1;
         const u16 common       = mixedA ? A : B;
 
-        const auto& hist = ensure_deep_history(); // 完美觸發 originalversion 的延遲拷貝機制
+        const auto& hist = ensure_deep_history();
         int count = 0;
         u16 identities = 0;
         bool oldestWasCheck = false;
-        
         for (int i = parity; i < int(hist.size()); i += 2)
         {
             StateInfo* x = hist[i];
@@ -1629,17 +1612,15 @@ Value Position::detect_sky_cycle(int d, int ply) {
             ++count;
         }
 
-        // 2. 多子身分放寬 (Multi-identity relaxation)
-        // 若在 6 回合內涉及多個棋子輪流將/捉，限制等級低於單子純長捉，純長捉方判負變招
+        // This is the only place the target's six-turn identity threshold belongs. Once six
+        // offensive turns involve multiple identities, that side is the less restrictive one.
         if (count >= 6 && (identities & u16(identities - 1)))
             return loss_for(pureColor);
-            
-        // 1. 相位追蹤 (Phase Tracking)
-        // 回溯歷史找序列起點，誰先發起並封閉了循環迴路誰就變招
         return loss_for(oldestWasCheck ? mixedColor : pureColor);
     }
 
-    // Fast Path 4: 雙方皆混合將捉，直接解相位，不觸發 memcpy
+    // When both sides alternate check/chase, the custom binary resolves the phase using the
+    // chaser identity on the non-checking half of the first two turns.
     if (mixedA && mixedB)
     {
         const bool phaseB = (checked(s1) && s0->skyChasers)
@@ -1647,8 +1628,12 @@ Value Position::detect_sky_cycle(int d, int ply) {
         return phaseB ? loss_for(BColor) : loss_for(AColor);
     }
 
+    // Ambiguous same-identity check/chase and pure-vs-pure folds are the only cases for which
+    // the target extends beyond the first repetition cycle. Its deep path counts offensive
+    // turns in six-turn blocks and only makes the multi-identity distinction after six turns.
+    // Reconstruct that narrow behavior without the v3 whole-history offenseCount heuristic.
     auto extended_multi = [&](Color side, u16 commonVictims) {
-        const auto& hist = ensure_deep_history(); // Slow Path 2: 這裡也會呼叫 ensure_deep_history()
+        const auto& hist = ensure_deep_history();
         int count = 0;
         u16 identities = 0;
         for (int i = side == AColor ? 0 : 1; i < int(hist.size()); i += 2)
@@ -1669,6 +1654,9 @@ Value Position::detect_sky_cycle(int d, int ply) {
         return false;
     };
 
+    // The current cycle itself is normally shorter than the target's six-turn expansion.
+    // If one side is already demonstrably multi-identity at that threshold, it is the less
+    // restrictive side and the other side must change. Otherwise equivalent folds are drawn.
     const bool multiA = extended_multi(AColor, A);
     const bool multiB = extended_multi(BColor, B);
     if (multiA != multiB)
@@ -1919,8 +1907,9 @@ bool Position::rule_judge(Value& result, int ply) {
         }
     }
 
-    // Configurable natural-move rule. Selecting YitianRule turns this off in the UCI callback,
-    // matching the target binary.
+    // Configurable natural-move rule. The Repetition Rule callback keeps this
+    // switched on for AsianRule/SkyRule/YitianRule with rule120/rule120/
+    // rule150 respectively.
     if (RuleConfig::sixtyMoveRule && RuleConfig::rule60MaxPly > 0
         && st->rule60 >= RuleConfig::rule60MaxPly)
     {

@@ -21,7 +21,6 @@
 
 #include <array>
 #include <cassert>
-#include <cstdint>
 #include <cstring>
 #include <deque>
 #include <iosfwd>
@@ -60,11 +59,11 @@ enum class DrawRule {
     REP_RED_WIN
 };
 
-extern RepetitionRule		repetitionRule;
-extern DrawRule				drawRule;
-extern int							mateThreatDepth;
-extern bool						sixtyMoveRule;
-extern int							rule60MaxPly;
+extern RepetitionRule repetitionRule;
+extern DrawRule       drawRule;
+extern int            mateThreatDepth;
+extern bool           sixtyMoveRule;
+extern int            rule60MaxPly;
 
 inline bool chinese_like() {
     return repetitionRule == RepetitionRule::CHINESE || repetitionRule == RepetitionRule::SKY;
