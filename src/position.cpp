@@ -431,7 +431,7 @@ bool Position::legal(Move m) const {
     assert(piece_on(king_square(us)) == make_piece(us, KING));
 
     if (type_of(piece_on(from)) == KING)
-        return !(checkers_to(~us, to, occupied) & ~b);
+        return !(checkers_to(~us, to, occupied));
 
     if (!st->needFullCheck
         && (!(blockers_for_king(us) & from)
@@ -1061,7 +1061,7 @@ bool Position::chase_legal(Move m, Bitboard b) const {
     assert(piece_on(king_square(us)) == make_piece(us, KING));
 
     if (type_of(piece_on(from)) == KING)
-        return !(checkers_to(~us, to, occupied));
+        return !(checkers_to(~us, to, occupied) & ~b);
 
     return !((checkers_to(~us, king_square(us), occupied) & ~square_bb(to)) & ~b);
 }
