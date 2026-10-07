@@ -21,7 +21,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
@@ -45,11 +44,11 @@ namespace Stockfish {
 namespace RuleConfig {
 
 enum class RepetitionRule {
+    SKY,
     ASIAN,
     CHINESE,
-    SKY,
-    COMPUTER,
     YITIAN,
+    COMPUTER,
     ALLOW_CHASE,
     NO_JUDGEMENT
 };
@@ -62,11 +61,11 @@ enum class DrawRule {
     REP_RED_WIN
 };
 
-extern std::atomic<RepetitionRule> repetitionRule;
-extern std::atomic<DrawRule>       drawRule;
-extern std::atomic<int>            mateThreatDepth;
-extern std::atomic<bool>           sixtyMoveRule;
-extern std::atomic<int>            rule60MaxPly;
+extern RepetitionRule repetitionRule;
+extern DrawRule       drawRule;
+extern int            mateThreatDepth;
+extern bool           sixtyMoveRule;
+extern int            rule60MaxPly;
 
 inline bool chinese_like() {
     return repetitionRule == RepetitionRule::CHINESE || repetitionRule == RepetitionRule::SKY;

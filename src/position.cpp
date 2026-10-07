@@ -17,10 +17,8 @@
 */
 
 #include "position.h"
-
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cassert>
 #include <cctype>
 #include <cstddef>
@@ -50,12 +48,11 @@ using namespace Attacks;
 
 namespace RuleConfig {
 // Defaults: SkyRule with rule120, Sixty Move Rule off.
-// AsianRule and SkyRule default to rule120 (enforced in engine.cpp couplings).
-std::atomic<RepetitionRule> repetitionRule{RepetitionRule::SKY};
-std::atomic<DrawRule>       drawRule{DrawRule::NONE};
-std::atomic<int>            mateThreatDepth{10};
-std::atomic<bool>           sixtyMoveRule{true};
-std::atomic<int>            rule60MaxPly{120};
+RepetitionRule repetitionRule  = RepetitionRule::SKY;
+DrawRule       drawRule        = DrawRule::NONE;
+int            mateThreatDepth = 10;
+bool           sixtyMoveRule   = false;
+int            rule60MaxPly    = 120;
 }  // namespace RuleConfig
 
 namespace Zobrist {
@@ -1403,8 +1400,38 @@ Value Position::detect_sky_cycle(int d, int ply) {
     if (mixedA && !mixedB && differentA) return loss_for(AColor);
     if (!mixedA && mixedB && differentB) return loss_for(BColor);
 
-    // Slow Path 1: 一將一捉對純長捉
-    if (mixedA != mixedB) return loss_for(mixedA ? AColor : BColor);
+    // Slow Path 1: 一將一捉對純長捉（精準判定多子身份與最舊走法相位）
+    if (mixedA != mixedB) {
+        evaluate_plies(historyDepth);
+
+        const Color mixedColor = mixedA ? AColor : BColor;
+        const Color pureColor  = mixedA ? BColor : AColor;
+        const int   parity     = mixedA ? 0 : 1;
+        const u16   common     = mixedA ? A : B;
+
+        int  count          = 0;
+        u16  identities     = 0;
+        bool oldestWasCheck = false;
+
+        for (int i = parity; i < historyDepth; i += 2) {
+            if (v_checked[i]) {
+                identities |= v_skyCheckers[i];
+                oldestWasCheck = true;
+            } else if (v_skyVictims[i] & common) {
+                identities |= v_skyChasers[i];
+                oldestWasCheck = false;
+            } else {
+                break;
+            }
+            ++count;
+        }
+
+        // 依天規六步身份閾值：當攻擊方累計達6步且涉及多個棋子身份時，視為限制較少的一方，改判純長捉方變招
+        if (count >= 6 && (identities & u16(identities - 1)))
+            return loss_for(pureColor);
+
+        return loss_for(oldestWasCheck ? mixedColor : pureColor);
+    }
 
     // Fast Path 4: 雙方皆混合將捉
     if (mixedA && mixedB) {
@@ -1636,7 +1663,7 @@ bool Position::rule_judge(Value& result, int ply) {
 
                     if (filter[st->key] <= 1)
                     {
-                        const int maxPly = std::max(1, RuleConfig::rule60MaxPly.load());
+                        const int maxPly = std::max(1, RuleConfig::rule60MaxPly);
                         if (st->rule60 < maxPly && st->previous->key == stp->previous->key)
                         {
                             StateInfo* prev = st->previous;
