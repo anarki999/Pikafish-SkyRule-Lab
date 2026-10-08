@@ -39,6 +39,9 @@ constexpr auto StartFEN = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNB
 
 class UCIEngine {
    public:
+    // Display normalization mode for cp scores, selected by the "ScoreType" UCI option.
+    enum class ScoreTypeMode { Elo, PAWN_VALUE_NORMALIZED, RAW };
+
     UCIEngine(CommandLine cli);
 
     void loop();
@@ -50,6 +53,8 @@ class UCIEngine {
     static std::string wdl(Value v, const Position& pos);
     static std::string to_lower(std::string str);
     static Move        to_move(const Position& pos, std::string str);
+
+    static inline ScoreTypeMode scoreTypeMode = ScoreTypeMode::Elo;
 
     Search::LimitsType parse_limits(std::istream& is);
 

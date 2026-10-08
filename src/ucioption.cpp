@@ -65,12 +65,6 @@ const Option& OptionsMap::operator[](const std::string& name) const {
     return it->second;
 }
 
-Option& OptionsMap::operator[](const std::string& name) {
-    auto it = options_map.find(name);
-    assert(it != options_map.end());
-    return it->second;
-}
-
 // Inits options and assigns idx in the correct printing order
 void OptionsMap::add(const std::string& name, const Option& option) {
     if (!options_map.count(name))
@@ -165,11 +159,15 @@ Option& Option::operator=(const std::string& v) {
 
     if (type == "combo")
     {
-        OptionsMap comboMap; // To have case insensitive compare
-        std::string token;
+        // [防重复token] 过滤掉 defaultValue 中重复的 token 再加入 comboMap,
+        // 防止 "ScoreType" 的 defaultValue 如 "Elo var Elo var PawnValueNormalized var Raw"
+        // 或 "Repetition Rule"/"Draw Rule" 的第一个默认token与后文枚举重复时,
+        // 在 OptionsMap::add 中触发重复断言而 std::exit(EXIT_FAILURE)。
+        OptionsMap         comboMap;  // To have case insensitive compare
+        std::string        token;
         std::istringstream ss(defaultValue);
         while (ss >> token)
-            if (!comboMap.count(token))
+            if (token != "var" && !comboMap.count(token))
                 comboMap.add(token, Option());
         if (!comboMap.count(v) || v == "var")
             return *this;

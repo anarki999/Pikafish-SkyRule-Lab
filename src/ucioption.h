@@ -84,7 +84,6 @@ class OptionsMap {
     void setoption(std::istringstream&);
 
     const Option& operator[](const std::string&) const;
-	Option& operator[](const std::string& name);
 
     void add(const std::string&, const Option& option);
 

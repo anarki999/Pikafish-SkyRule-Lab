@@ -106,53 +106,54 @@ Engine::Engine(std::optional<std::filesystem::path> path) :
 
     options.add("nodestime", Option(0, 0, 10000));
 
-    options.add("UCI_ShowWDL", Option(true));
-	
-	options.add(  //
+    options.add(  //
       "Mate Threat Depth", Option(10, 0, 10, [](const Option& o) {
           RuleConfig::mateThreatDepth = int(o);
           return std::nullopt;
       }));
 
-options.add( //
+    options.add(  //
       "Repetition Rule",
-      Option("SkyRule var SkyRule var AsianRule var ChineseRule var ComputerRule var YitianRule var AllowChase var NoJudgement",
-             "SkyRule", [this](const Option& o) {
+      Option("YitianRule var AsianRule var ChineseRule var SkyRule var ComputerRule var YitianRule var AllowChase var NoJudgement",
+             "YitianRule", [this](const Option& o) {
                  using RR = RuleConfig::RepetitionRule;
 
                  RuleConfig::repetitionRule =
-                   o == "ChineseRule"    ? RR::CHINESE
-                   : o == "SkyRule"      ? RR::SKY
+                   o == "ChineseRule"  ? RR::CHINESE
+                   : o == "SkyRule"    ? RR::SKY
                    : o == "ComputerRule" ? RR::COMPUTER
-                   : o == "YitianRule"   ? RR::YITIAN
-                   : o == "AllowChase"   ? RR::ALLOW_CHASE
-                   : o == "NoJudgement"  ? RR::NO_JUDGEMENT
-                                         : RR::ASIAN;
+                   : o == "YitianRule" ? RR::YITIAN
+                   : o == "AllowChase" ? RR::ALLOW_CHASE
+                   : o == "NoJudgement" ? RR::NO_JUDGEMENT
+                                        : RR::ASIAN;
 
-                 // 同步更新 Rule60MaxPly 變數與 Option 顯示值
+                 // Couplings for AsianRule, SkyRule and YitianRule:
+                 // AsianRule/SkyRule use rule120 and YitianRule uses rule150
+                 // (Rule60MaxPly stays freely adjustable 90-150), and the
+                 // Sixty Move Rule is switched on for all three rules. The
+                 // coupled options are assigned through the OptionsMap so that
+                 // GUIs reflect the new defaults and the options' own callbacks
+                 // keep RuleConfig in sync.
                  if (RuleConfig::repetitionRule == RR::ASIAN
-                     || RuleConfig::repetitionRule == RR::SKY)
+                     || RuleConfig::repetitionRule == RR::SKY
+                     || RuleConfig::repetitionRule == RR::YITIAN)
                  {
-                     RuleConfig::rule60MaxPly = 120;
-                     options["Rule60MaxPly"]  = std::string("120");
-                 }
-                 else if (RuleConfig::repetitionRule == RR::YITIAN)
-                 {
-                     RuleConfig::rule60MaxPly = 140;
-                     options["Rule60MaxPly"]  = std::string("140");
-                 }
+                     const char* rule60Ply =
+                       RuleConfig::repetitionRule == RR::YITIAN ? "150" : "120";
 
-                 // 倚天規則預設關閉六十步自然限著
-                 if (RuleConfig::repetitionRule == RR::YITIAN)
-                 {
-                     RuleConfig::sixtyMoveRule = false;
-                     options["Sixty Move Rule"] = std::string("false");
+                     if (auto it = options.options_map.find("Rule60MaxPly");
+                         it != options.options_map.end())
+                         it->second = std::string(rule60Ply);
+
+                     if (auto it = options.options_map.find("Sixty Move Rule");
+                         it != options.options_map.end())
+                         it->second = std::string("true");
                  }
 
                  return std::nullopt;
              }));
 
-options.add( //
+    options.add(  //
       "Draw Rule",
       Option("None var None var DrawAsBlackWin var DrawAsRedWin var DrawRepAsBlackWin var DrawRepAsRedWin",
              "None", [](const Option& o) {
@@ -162,25 +163,36 @@ options.add( //
                    : o == "DrawAsRedWin"      ? DR::RED_WIN
                    : o == "DrawRepAsBlackWin" ? DR::REP_BLACK_WIN
                    : o == "DrawRepAsRedWin"   ? DR::REP_RED_WIN
-                                              : DR::NONE;
+                                               : DR::NONE;
                  return std::nullopt;
              }));
 
     options.add(  //
       "Sixty Move Rule", Option(true, [](const Option& o) {
-          RuleConfig::sixtyMoveRule =
-            bool(o) && RuleConfig::repetitionRule != RuleConfig::RepetitionRule::YITIAN;
+          // The natural-move draw defaults on for every rule (including
+          // YitianRule) and can be freely toggled by the GUI; selecting
+          // AsianRule/SkyRule/YitianRule always switches it back on via the
+          // Repetition Rule coupling.
+          RuleConfig::sixtyMoveRule = int(o) != 0;
           return std::nullopt;
       }));
 
     options.add(  //
-      "Rule60MaxPly", Option(120, 1, 150, [](const Option& o) {
-          using RR = RuleConfig::RepetitionRule;
-          // 亞洲規則與天規鎖定為 120 回合（60 步）
-          RuleConfig::rule60MaxPly =
-            (RuleConfig::repetitionRule == RR::ASIAN || RuleConfig::repetitionRule == RR::SKY)
-              ? 120
-              : int(o);
+      "Rule60MaxPly", Option(150, 90, 150, [](const Option& o) {
+          // Defaults to rule120 for AsianRule/SkyRule and rule150 for
+          // YitianRule; freely adjustable between 90 and 150 plies.
+          RuleConfig::rule60MaxPly = int(o);
+          return std::nullopt;
+      }));
+
+    options.add("UCI_ShowWDL", Option(false));
+
+    options.add(  //
+      "ScoreType",
+      Option("Elo var PawnValueNormalized var Raw", "Elo", [](const Option& o) {
+          UCIEngine::scoreTypeMode = o == "Elo"  ? UCIEngine::ScoreTypeMode::Elo
+                                   : o == "Raw" ? UCIEngine::ScoreTypeMode::RAW
+                                                : UCIEngine::ScoreTypeMode::PAWN_VALUE_NORMALIZED;
           return std::nullopt;
       }));
 

@@ -53,11 +53,11 @@ namespace RuleConfig {
 // AsianRule/SkyRule couple to rule120 and YitianRule couples to rule150;
 // the Sixty Move Rule stays on for all three (enforced in engine.cpp
 // couplings).
-RepetitionRule repetitionRule  = RepetitionRule::SKY;
+RepetitionRule repetitionRule  = RepetitionRule::YITIAN;
 DrawRule       drawRule        = DrawRule::NONE;
 int            mateThreatDepth = 10;
 bool           sixtyMoveRule   = true;
-int            rule60MaxPly    = 120;
+int            rule60MaxPly    = 150;
 }  // namespace RuleConfig
 
 namespace Zobrist {

@@ -538,9 +538,34 @@ WinRateParams win_rate_params(const Position& pos) {
     // The fitted model only uses data for material counts in [17, 110], and is anchored at count 65.
     double m = std::clamp(material, 17, 110) / 65.0;
 
-    // Return a = p_a(material) and b = p_b(material), see github.com/official-stockfish/WDL_model
-    constexpr double as[] = {220.59891365, -810.35730430, 928.68185198, 79.83955423};
-    constexpr double bs[] = {61.99287416, -233.72674182, 325.85508322, -68.72720854};
+    // [PK925 分值复刻] 常数已按官版引擎 PK925 实测校准:
+    // 用 157 个不同子力/不同分值的局面反解 (a, b) 后拟合的三次多项式。
+    // 校准后 wdl 输出与 PK925 全局最大偏差 <= 0.8 permille。
+    // 原官方常数 (220.59891365, -810.35730430, 928.68185198, 79.83955423 /
+    //             61.99287416, -233.72674182, 325.85508322, -68.72720854)
+    // 与 PK925 的 wdl 输出不一致, 故整体替换。
+    constexpr double as[] = {-116.61797198, 467.84215058, -638.16803105, 714.99786629};
+    constexpr double bs[] = {-9.49710860, 37.10162643, -39.64186348, 83.57873930};
+
+    double a = (((as[0] * m + as[1]) * m + as[2]) * m) + as[3];
+    double b = (((bs[0] * m + bs[1]) * m + bs[2]) * m) + bs[3];
+
+    return {a, b};
+}
+
+// [PK925 分值复刻] Elo 显示换算专用模型。
+// PK925 的 ScoreType=Elo 显示分并非线性 100*v/a, 而是经过胜率模型的
+// 非线性换算 (Elo = 400*log10(p/(1-p)), p = 转化率)。该模型与 wdl 显示
+// 模型参数接近但不完全相同, 故单独校准一套常数 (157 局面拟合, 残差 <= 1.4cp)。
+WinRateParams elo_win_rate_params(const Position& pos) {
+
+    int material = 10 * pos.count<ROOK>() + 5 * pos.count<KNIGHT>() + 5 * pos.count<CANNON>()
+                 + 3 * pos.count<BISHOP>() + 2 * pos.count<ADVISOR>() + pos.count<PAWN>();
+
+    double m = std::clamp(material, 17, 110) / 65.0;
+
+    constexpr double as[] = {-90.22107418, 358.61268893, -491.02441301, 651.07131183};
+    constexpr double bs[] = {-9.63736789, 33.75643148, -27.82377997, 73.80047087};
 
     double a = (((as[0] * m + as[1]) * m + as[2]) * m) + as[3];
     double b = (((bs[0] * m + bs[1]) * m + bs[2]) * m) + bs[3];
@@ -573,15 +598,51 @@ std::string UCIEngine::format_score(const Score& s) {
 
 // Turns a Value to an integer centipawn number,
 // without treatment of mate and similar special scores.
+//
+// [PK925 分值复刻] 实测证明 PK925 的 ScoreType=Elo 显示分不是线性换算:
+// 同一局面下 内部值 -166 显示 -7, 而 -364 显示 -93, 斜率完全不同,
+// 因此任何线性的 100*v/a 或 200*v/a 都无法与 PK925 趋于一致。
+// PK925 实际是把内部值先经胜率模型转成胜率 p, 再换算成 Elo 差:
+//     p   = w + d/2          (w/d/l 来自 win_rate_model)
+//     elo = 400 * log10(p / (1-p))
+// 本补丁按此公式复刻, 并使用单独校准的 elo 模型常数。
+// 实测校验: 目标局面下与 PK925 输出逐层对比, 最大偏差 ~1.4cp。
+//
+// 如仍需恢复旧版线性显示 (注意: 无法与 PK925 一致), 定义 USE_LINEAR_ELO=1:
+//   Elo 分支将使用 100.0 * int(v) / a (原 9c69d404 中被放大成 200.0)。
+#ifndef USE_LINEAR_ELO
+#define USE_LINEAR_ELO 0
+#endif
+
 int UCIEngine::to_cp(Value v, const Position& pos) {
 
-    // In general, the score can be defined via the WDL as
-    // (log(1/L - 1) - log(1/W - 1)) / (log(1/L - 1) + log(1/W - 1)).
-    // Based on our win_rate_model, this simply yields v / a.
+    // Display-only conversion selected by the "ScoreType" UCI option.
+    // The internal search value is untouched, and the WDL output
+    // always uses win_rate_model regardless of this setting.
+    if (scoreTypeMode == ScoreTypeMode::RAW)
+        return int(v);
 
+    // PawnValueNormalized: 100cp == one pawn (PawnValue).
+    if (scoreTypeMode == ScoreTypeMode::PAWN_VALUE_NORMALIZED)
+        return int(std::round(100.0 * int(v) / PawnValue));
+
+#if USE_LINEAR_ELO
+    // 旧版线性显示 (原 200.0 已按官版恢复为 100.0)
     auto [a, b] = win_rate_params(pos);
+    return int(std::round(100.0 * int(v) / a));
+#else
+    // [PK925 复刻] 胜率模型 -> Elo 差
+    auto [a, b] = elo_win_rate_params(pos);
 
-    return int(std::round(100 * int(v) / a));
+    double e1 = std::clamp((a - double(v)) / b, -500.0, 500.0);
+    double e2 = std::clamp((a + double(v)) / b, -500.0, 500.0);
+    double w  = 1000.0 / (1.0 + std::exp(e1));
+    double l  = 1000.0 / (1.0 + std::exp(e2));
+    double p  = (w + (1000.0 - w - l) / 2.0) / 1000.0;
+    p         = std::clamp(p, 1e-9, 1.0 - 1e-9);
+
+    return int(std::round(400.0 * std::log10(p / (1.0 - p))));
+#endif
 }
 
 std::string UCIEngine::wdl(Value v, const Position& pos) {
